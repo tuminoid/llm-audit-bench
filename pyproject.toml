@@ -1,0 +1,22 @@
+[project]
+name = "llm-audit-bench"
+version = "1.0.0"
+description = "AuditBench v1 serving benchmark and Capability Check v1 compatibility gate for OpenAI-compatible LLM endpoints"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+audit-bench = "audit_bench:main"
+capability-check = "capability_check:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# The modules stay importable as plain files under src/: consumers add
+# <checkout>/src to PYTHONPATH or rsync the two files next to their
+# adapters, so they must remain single self-contained modules.
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["audit_bench", "capability_check"]
