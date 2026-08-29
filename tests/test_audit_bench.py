@@ -24,7 +24,9 @@ from audit_bench import (
     _measure_replay_concurrent,
     _measure_replays,
     _output_dir,
+    _probe_token_accounting,
     _publication_status,
+    _validate_results,
     audit_prompt,
     build_plan,
     REPLAY_PROBE_TOKENS,
@@ -654,32 +656,34 @@ class AuditBenchTest(unittest.TestCase):
     }
 
     def _run_fake_protocol(
-        self,
-        extra_env: dict,
-        output_format: str = "json",
-        openai_chat=None,
+        self, extra_env: dict, request=None
     ) -> tuple[int, str]:
         output = io.StringIO()
-        with tempfile.TemporaryDirectory() as directory:
-            env = {
-                **self._FAKE_ENV,
-                "AUDIT_BENCH_OUTPUT_DIR": directory,
-                **extra_env,
-            }
-            with mock.patch.dict(os.environ, env, clear=False):
-                with contextlib.redirect_stdout(output):
-                    result = run_benchmark(
-                        runtime="fake",
-                        tag="fake-model",
-                        model="fake-model",
-                        context=131072,
-                        request=self._fake_request,
-                        active_slots=1,
-                        kv_pool_tokens=131072,
-                        output_format=output_format,
-                        openai_chat=openai_chat,
-                    )
+        with mock.patch.dict(os.environ, {**self._FAKE_ENV, **extra_env}, clear=False):
+            with contextlib.redirect_stdout(output):
+                result = run_benchmark(
+                    runtime="fake",
+                    tag="fake-model",
+                    model="fake-model",
+                    context=131072,
+                    request=self._fake_request if request is None else request,
+                    active_slots=1,
+                    kv_pool_tokens=131072,
+                )
         return result, output.getvalue()
+
+    def _quirked_fake(self, prompt: str, max_tokens: int, seed: int) -> RequestResult:
+        """Fake backend with the characterized LM Studio off-by-one."""
+        result = self._fake_request(prompt, max_tokens, seed)
+        reported = max(0, result.output_tokens - 1)
+        return dataclasses.replace(
+            result,
+            output_tokens=reported,
+            details={
+                "visible_content": reported > 0,
+                "finish_reason": "length",
+            },
+        )
 
     def test_fake_adapter_runs_the_complete_protocol(self):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
@@ -1023,6 +1027,268 @@ class AuditBenchTest(unittest.TestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 chat([], [], 1)
         self.assertIn("without choices", str(ctx.exception))
+
+    @staticmethod
+    def _accounting_fake(kind: str):
+        def request(prompt: str, max_tokens: int, seed: int) -> RequestResult:
+            del prompt, seed
+            if kind == "healthy":
+                reported, visible, reason = max_tokens, True, "length"
+            elif kind == "quirked":
+                reported = max(0, max_tokens - 1)
+                visible, reason = reported > 0, "length"
+            elif kind == "partial":
+                reported = (
+                    max_tokens - 1 if max_tokens == 8 else max_tokens
+                )
+                visible, reason = True, "length"
+            elif kind == "thinking":
+                reported = max(0, max_tokens - 1)
+                visible, reason = False, "length"
+            elif kind == "stopped":
+                # A natural stop that happens to end one token short of
+                # its cap: same reported counts as the quirk, but the
+                # decode loop ended on the model, not the cap.
+                reported = max(0, max_tokens - 1)
+                visible, reason = reported > 0, "stop"
+            else:  # unreported: the adapter never set details
+                reported = max(0, max_tokens - 1)
+                visible, reason = None, None
+            details = (
+                {}
+                if visible is None
+                else {
+                    "visible_content": visible,
+                    "finish_reason": reason,
+                }
+            )
+            return RequestResult(
+                prompt_tokens=100,
+                output_tokens=reported,
+                seconds=0.1,
+                details=details,
+            )
+
+        return request
+
+    def test_tolerate_off_by_one_env_and_canonicality(self):
+        for value, expected in (
+            ("", False),
+            ("1", True),
+            ("true", True),
+            ("YES", True),
+            ("0", False),
+        ):
+            with mock.patch.dict(
+                os.environ,
+                {"AUDIT_BENCH_TOLERATE_OFF_BY_ONE": value},
+                clear=False,
+            ):
+                parsed = Settings.from_env()
+                self.assertEqual(
+                    parsed.tolerate_off_by_one, expected, value
+                )
+                # Requesting the tolerance marks nothing on its own; the
+                # run stays canonical until the probe applies it.
+                self.assertIsNone(parsed.token_accounting)
+                self.assertTrue(parsed.canonical)
+        applied = dataclasses.replace(
+            Settings.from_env(),
+            tolerate_off_by_one=True,
+            token_accounting={"applied": True, "offset": -1},
+        )
+        self.assertFalse(applied.canonical)
+
+    def test_probe_token_accounting_signature(self):
+        accounting = _probe_token_accounting(
+            self._accounting_fake("quirked")
+        )
+        self.assertTrue(accounting["applied"])
+        self.assertEqual(accounting["offset"], -1)
+        self.assertEqual(
+            [
+                (
+                    item["max_tokens"],
+                    item["reported"],
+                    item["finish_reason"],
+                )
+                for item in accounting["evidence"]
+            ],
+            [(1, 0, "length"), (8, 7, "length"), (32, 31, "length")],
+        )
+        for kind in ("healthy", "partial", "stopped"):
+            accounting = _probe_token_accounting(
+                self._accounting_fake(kind)
+            )
+            self.assertFalse(accounting["applied"], kind)
+            self.assertEqual(accounting["offset"], 0)
+        for kind in ("thinking", "unreported"):
+            with self.assertRaises(RuntimeError, msg=kind):
+                _probe_token_accounting(self._accounting_fake(kind))
+
+    def test_flag_with_quirked_backend_completes_non_canonical(self):
+        result, text = self._run_fake_protocol(
+            {"AUDIT_BENCH_TOLERATE_OFF_BY_ONE": "1"},
+            request=self._quirked_fake,
+        )
+        self.assertEqual(result, 0)
+        report = json.loads(text.splitlines()[-1])
+        self.assertFalse(report["canonical"])
+        # A non-canonical run can never be publishable: the publication
+        # status appends noncanonical_settings, and publishable means no
+        # reasons at all.
+        self.assertFalse(report["publishable"])
+        self.assertIn("noncanonical_settings", report["publication_reasons"])
+        self.assertTrue(report["settings"]["tolerate_off_by_one"])
+        accounting = report["settings"]["token_accounting"]
+        self.assertTrue(accounting["applied"])
+        self.assertEqual(accounting["offset"], -1)
+        self.assertEqual(list(report["decode"]["by_streams"]), ["1"])
+
+    def test_flag_with_healthy_backend_changes_nothing(self):
+        # The fake env is deliberately non-canonical (reduced streams and
+        # samples), so the assertion is relational: requesting the
+        # tolerance must leave every verdict identical to not requesting
+        # it when the probe finds no quirk.
+        flagged, flagged_text = self._run_fake_protocol(
+            {"AUDIT_BENCH_TOLERATE_OFF_BY_ONE": "1"}
+        )
+        plain, plain_text = self._run_fake_protocol({})
+        self.assertEqual(flagged, 0)
+        self.assertEqual(plain, 0)
+        flagged_report = json.loads(flagged_text.splitlines()[-1])
+        plain_report = json.loads(plain_text.splitlines()[-1])
+        self.assertTrue(flagged_report["settings"]["tolerate_off_by_one"])
+        self.assertFalse(plain_report["settings"]["tolerate_off_by_one"])
+        self.assertIsNone(plain_report["settings"]["token_accounting"])
+        self.assertFalse(
+            flagged_report["settings"]["token_accounting"]["applied"]
+        )
+        self.assertEqual(flagged_report["canonical"], plain_report["canonical"])
+        self.assertEqual(
+            flagged_report["publishable"], plain_report["publishable"]
+        )
+        self.assertEqual(
+            flagged_report["publication_reasons"],
+            plain_report["publication_reasons"],
+        )
+        self.assertEqual(flagged_report["plan"], plain_report["plan"])
+        self.assertEqual(
+            list(flagged_report["decode"]["by_streams"]),
+            list(plain_report["decode"]["by_streams"]),
+        )
+
+    def test_adapter_reports_visible_content_in_details(self):
+        def make_urlopen(content: str):
+            def fake_urlopen(request, timeout=None):
+                del request
+
+                class _Resp:
+                    def __enter__(self):
+                        return self
+
+                    def __exit__(self, t, e, tb):
+                        return False
+
+                    def read(self):
+                        return json.dumps(
+                            {
+                                "choices": [
+                                    {
+                                        "message": {"content": content},
+                                        "finish_reason": "length",
+                                    }
+                                ],
+                                "usage": {
+                                    "prompt_tokens": 5,
+                                    "completion_tokens": 1,
+                                },
+                            }
+                        )
+
+                return _Resp()
+
+            return fake_urlopen
+
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=make_urlopen("ok")
+        ):
+            result = OpenAIChatAdapter("http://127.0.0.1:1", "m", 10)(
+                "hi", 1, 0
+            )
+        self.assertTrue(result.details["visible_content"])
+        self.assertEqual(result.details["finish_reason"], "length")
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=make_urlopen("  ")
+        ):
+            result = OpenAIChatAdapter("http://127.0.0.1:1", "m", 10)(
+                "hi", 1, 0
+            )
+        self.assertFalse(result.details["visible_content"])
+        self.assertEqual(result.details["finish_reason"], "length")
+
+    @staticmethod
+    def _stream(output: int, reason: str | None) -> RequestResult:
+        details: dict[str, bool | str | None] = {
+            "visible_content": output > 0
+        }
+        if reason is not None:
+            details["finish_reason"] = reason
+        return RequestResult(
+            prompt_tokens=100,
+            output_tokens=output,
+            seconds=0.1,
+            details=details,
+        )
+
+    def test_validate_results_off_by_one_is_exact_and_length_only(self):
+        def validate(
+            results: list[RequestResult],
+            expected: int,
+            off_by_one: bool,
+        ) -> None:
+            _validate_results(
+                results,
+                expected,
+                None,
+                131072,
+                0.02,
+                False,
+                off_by_one,
+            )
+
+        # Confirmed quirk: length-path streams validate at exactly
+        # expected - 1.
+        validate(
+            [self._stream(7, "length") for _ in range(3)], 8, True
+        )
+        # The hole a range gate would leave open: a one-token request
+        # whose stream emitted EOS first reports 1 with empty content and
+        # ended before the cap, so it cannot be read at the -1 offset.
+        with self.assertRaises(RuntimeError) as ctx:
+            validate([self._stream(1, "stop")], 1, True)
+        self.assertIn("finish reasons", str(ctx.exception))
+        # A stream that ended before the cap fails even when its count
+        # happens to equal the offset.
+        with self.assertRaises(RuntimeError) as ctx:
+            validate([self._stream(7, "stop") for _ in range(3)], 8, True)
+        self.assertIn("finish reasons", str(ctx.exception))
+        # The healthy count under an applied tolerance is not "one less
+        # work" either: it fails the exact gate.
+        with self.assertRaises(RuntimeError) as ctx:
+            validate([self._stream(8, "length") for _ in range(3)], 8, True)
+        self.assertIn("expected 7 per stream", str(ctx.exception))
+        # A missing finish_reason fails closed like a missing
+        # visible_content report.
+        with self.assertRaises(RuntimeError) as ctx:
+            validate([self._stream(7, None) for _ in range(3)], 8, True)
+        self.assertIn("finish_reason", str(ctx.exception))
+        # Strict mode is unchanged: exactly expected, and finish reasons
+        # are not consulted.
+        validate([self._stream(8, "stop") for _ in range(3)], 8, False)
+        with self.assertRaises(RuntimeError) as ctx:
+            validate([self._stream(7, "length") for _ in range(3)], 8, False)
+        self.assertIn("expected 8 per stream", str(ctx.exception))
 
 
 class CliMainTest(unittest.TestCase):

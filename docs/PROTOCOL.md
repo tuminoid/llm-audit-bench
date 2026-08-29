@@ -128,6 +128,57 @@ startup override therefore fails rather than producing a mislabeled result.
 Changing a canonical setting marks the JSON result `canonical: false`. That is
 useful for tuning, but it is not a publishable cross-host result.
 
+### Backend token-accounting deviation (off-by-one tolerance)
+
+Some backends run their decode loop one token short. First documented:
+LM Studio 0.4.22, which on length-capped generations -- every
+`ignore_eos` stream in this protocol -- decodes `max_tokens - 1` tokens
+and reports that count, while on natural stops it counts the stop token
+and reports one more than the visible content. The exact-match
+validation rejects every stream such a backend serves, so the protocol
+carries a characterized, evidence-gated tolerance:
+
+- `AUDIT_BENCH_TOLERATE_OFF_BY_ONE=1` requests the tolerance. Before
+  the warmup gate, the harness sends three length-capped characterization
+  probes (max_tokens 1, 8, 32; a fixed 40-repetition prompt) and applies
+  it only when every probe is length-capped (`finish_reason` `length`),
+  reports exactly `max_tokens - 1` tokens, and the largest probe returns
+  visible content. Counts alone cannot confirm the length path: a natural
+  stop that happens to end one token short of its cap reports the same
+  count, so a probe that ended early never confirms the quirk. Any other
+  deviation -- including a model that burns the budget on reasoning
+  content, or an adapter that does not report visibility or
+  `finish_reason` -- leaves validation strict or fails the run with an
+  actionable diagnostic; no blanket tolerance exists.
+- The probes feed the validation gate and the JSON only; they are never
+  measurement data and never change the plan.
+- With the tolerance applied, length-path streams validate at exactly
+  `expected - 1` -- the confirmed count, never a range -- and any stream
+  whose `finish_reason` is not `length` fails the run: a stream that
+  ended before the cap reports its stop token and cannot be read at the
+  -1 offset.
+- A run where the tolerance was applied is `canonical: false` -- each
+  stream executed one token less work than the canonical workload
+  prescribes -- and therefore not publishable; `publication_reasons`
+  records `noncanonical_settings`. Its metrics use the server-reported
+  counts unchanged; a reader comparing against spec-conformant backends
+  applies the recorded offset.
+- The natural-stop +1 affects conversation and replay usage accounting
+  by one token per turn; it changes no gate in those profiles.
+- The request is recorded as `settings.tolerate_off_by_one`; the probe
+  result as `settings.token_accounting` (`applied`, `offset`, per-probe
+  `evidence`, `note`), and single-prompt `adapter_details` carry a
+  `visible_content` boolean and a `finish_reason` string. An adapter
+  that does not report either leaves validation strict or fails the run
+  with an actionable diagnostic.
+
+**Amendment (2026-08-29):** added the tolerance above, the
+characterization probe, the two new settings keys, and the
+`visible_content` and `finish_reason` adapter details, bumping
+`SCHEMA_VERSION` to 5. The tolerance is applied only under the exact
+characterized signature, changes no workload shape, and marks affected
+runs `canonical: false`, so existing canonical results remain comparable.
+
 ## Result provenance and publication
 
 AuditBench JSON has a schema version and keeps workload canonicality separate

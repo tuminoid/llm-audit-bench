@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -96,7 +96,12 @@ OUTPUT_CONTROL = (
 
 @dataclass(frozen=True)
 class RequestResult:
-    """One completed inference request."""
+    """One completed inference request.
+
+    ``details`` carries adapter-reported evidence; the off-by-one
+    tolerance contract (docs/PROTOCOL.md) reads ``visible_content`` and
+    ``finish_reason`` from it, and fails closed when they are missing.
+    """
 
     prompt_tokens: int
     output_tokens: int
@@ -238,6 +243,8 @@ class Settings:
     gate_cmd: str | None = None
     system_prompt: str | None = None
     reasoning_effort: str | None = None
+    tolerate_off_by_one: bool = False
+    token_accounting: dict | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -342,6 +349,14 @@ class Settings:
             system_prompt=os.environ.get("AUDIT_BENCH_SYSTEM_PROMPT") or None,
             reasoning_effort=os.environ.get("AUDIT_BENCH_REASONING_EFFORT")
             or None,
+            # Backend accounting tolerance (docs/PROTOCOL.md
+            # "Backend token-accounting deviation"). The request is recorded;
+            # whether it is applied is decided by the runtime probe and
+            # lands in token_accounting.
+            tolerate_off_by_one=os.environ.get(
+                "AUDIT_BENCH_TOLERATE_OFF_BY_ONE", "0"
+            ).lower()
+            in {"1", "true", "yes"},
         )
 
     @property
@@ -368,6 +383,15 @@ class Settings:
             and self.output_tokens == DEFAULT_OUTPUT_TOKENS
             and self.deep_output_tokens == DEFAULT_DEEP_OUTPUT_TOKENS
             and self.tolerance == DEFAULT_TOLERANCE
+            # Requesting the tolerance marks nothing: on a spec-conformant
+            # backend the probe finds no quirk, validation stays strict, and
+            # the run stays canonical. Only an applied tolerance (the probe
+            # confirmed the backend decodes one token short) makes the
+            # executed work deviate from the canonical workload.
+            and not (
+                self.tolerate_off_by_one
+                and (self.token_accounting or {}).get("applied")
+            )
         )
 
     def to_dict(self) -> dict:
@@ -669,10 +693,20 @@ class OpenAIChatAdapter:
             message = exc.read().decode(errors="replace")
             raise RuntimeError(f"{exc.code} from {self.url}: {message}") from exc
         usage = body.get("usage") or {}
+        choice = (body.get("choices") or [{}])[0]
+        content = (choice.get("message") or {}).get("content")
         return RequestResult(
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             output_tokens=int(usage.get("completion_tokens", 0)),
             seconds=time.monotonic() - started,
+            # Whether the endpoint returned any visible (non-reasoning)
+            # content, and how the decode loop ended. Factual server
+            # observations; the token-accounting probe and the length-path
+            # validation read both, nothing rewrites them.
+            details={
+                "visible_content": bool((content or "").strip()),
+                "finish_reason": choice.get("finish_reason"),
+            },
         )
 
 
@@ -751,6 +785,91 @@ def _run_parallel(
     return results, time.monotonic() - started
 
 
+# Characterization probe for backends that run the decode loop one token
+# short (docs/PROTOCOL.md "Backend token-accounting deviation"). The prompt
+# demands far more output than every probe cap, so a compliant model is
+# length-capped on all three probes and a backend with the quirk reports
+# exactly max_tokens - 1 on each.
+_PROBE_PROMPT = (
+    "Reply with exactly 40 repetitions of the word foo, separated by "
+    "single spaces, and nothing else."
+)
+_PROBE_MAX_TOKENS = (1, 8, 32)
+
+
+def _probe_token_accounting(request: RequestFn) -> dict:
+    """Probe the backend's length-path accounting and decide the tolerance.
+
+    The tolerance is applied only under the exact characterized signature:
+    every probe is length-capped (finish_reason "length"), reports
+    max_tokens - 1, and the largest probe shows visible content (a thinking
+    model burning the whole budget on reasoning_content would otherwise
+    measure reasoning, not answers). Counts alone cannot confirm the length
+    path: a natural stop that happens to end one token short of its cap
+    reports the same count, so a probe that ended early never confirms the
+    quirk. A missing visibility or finish_reason report fails closed.
+    Probes feed the validation gate and the JSON only; they are never
+    measurement data.
+    """
+    evidence = []
+    for max_tokens in _PROBE_MAX_TOKENS:
+        result = request(_PROBE_PROMPT, max_tokens, 0)
+        evidence.append(
+            {
+                "max_tokens": max_tokens,
+                "reported": result.output_tokens,
+                "visible_content": result.details.get("visible_content"),
+                "finish_reason": result.details.get("finish_reason"),
+            }
+        )
+    reported = [item["reported"] for item in evidence]
+    reasons = [item["finish_reason"] for item in evidence]
+    applied = all(
+        item["reported"] == item["max_tokens"] - 1
+        and item["finish_reason"] == "length"
+        for item in evidence
+    )
+    if applied:
+        visible = evidence[-1]["visible_content"]
+        if visible is False:
+            raise RuntimeError(
+                "token-accounting quirk confirmed (backend decodes "
+                "max_tokens - 1) but the model emitted no visible content; "
+                "set AUDIT_BENCH_REASONING_EFFORT to disable thinking, or "
+                "unset AUDIT_BENCH_TOLERATE_OFF_BY_ONE"
+            )
+        if visible is None:
+            raise RuntimeError(
+                "token-accounting quirk confirmed but the request adapter "
+                "does not report visible_content in RequestResult.details; "
+                "the tolerance cannot be safely applied"
+            )
+    elif all(
+        item["reported"] == item["max_tokens"] - 1 for item in evidence
+    ) and any(reason is None for reason in reasons):
+        raise RuntimeError(
+            "off-by-one probe counts match (backend decodes max_tokens - "
+            f"1, reported {reported}) but the request adapter does not "
+            "report finish_reason in RequestResult.details; the length path "
+            "cannot be confirmed, so the tolerance is not applied; have the "
+            "adapter report choices[0].finish_reason, or unset "
+            "AUDIT_BENCH_TOLERATE_OFF_BY_ONE"
+        )
+    return {
+        "applied": applied,
+        "offset": -1 if applied else 0,
+        "evidence": evidence,
+        "note": (
+            "backend decodes max_tokens - 1 on length-capped generations "
+            "(finish_reason length); natural stops count the stop token; "
+            "length-path streams validated at the exact confirmed count, "
+            "and a stream that ended before the cap fails the run"
+            if applied
+            else "no off-by-one quirk detected; validation stays strict"
+        ),
+    }
+
+
 def _validate_results(
     results: list[RequestResult],
     expected_output: int,
@@ -758,11 +877,37 @@ def _validate_results(
     context: int,
     tolerance: float,
     near_context: bool,
+    off_by_one: bool = False,
 ) -> None:
     outputs = [result.output_tokens for result in results]
-    if any(output != expected_output for output in outputs):
+    if off_by_one:
+        # The confirmed quirk makes a reported count ambiguous: a
+        # length-capped stream reports decoded - 1, while a stream that
+        # ended before the cap reports visible + 1 (the stop token is
+        # counted). Only the length path can be validated, at the exact
+        # confirmed count -- never a range.
+        reasons = [
+            result.details.get("finish_reason") for result in results
+        ]
+        if any(reason is None for reason in reasons):
+            raise RuntimeError(
+                f"finish reasons {reasons}: an adapter did not report "
+                "finish_reason in RequestResult.details; a stream at the "
+                "confirmed -1 offset cannot be distinguished from one that "
+                "ended before the cap, so the run is not valid"
+            )
+        if any(reason != "length" for reason in reasons):
+            raise RuntimeError(
+                f"finish reasons {reasons}: a stream ended before the "
+                "length cap, so its reported count includes the stop "
+                "token and cannot be validated at the confirmed -1 offset"
+            )
+    expected_here = expected_output - 1 if off_by_one else expected_output
+    if any(output != expected_here for output in outputs):
         raise RuntimeError(
-            f"output token count was {outputs}, expected {expected_output} per stream"
+            f"output token count was {outputs}, expected {expected_here} "
+            "per stream"
+            + (" under the confirmed -1 tolerance" if off_by_one else "")
         )
     prompts = [result.prompt_tokens for result in results]
     if any(prompt <= 0 for prompt in prompts):
@@ -1559,6 +1704,7 @@ def _measure_once(
     target_prompt: int | None = None,
     near_context: bool = False,
     gate_cmd: str | None = None,
+    off_by_one: bool = False,
 ) -> dict:
     _wait_for_gate(gate_cmd)
     if prompt_lines is None:
@@ -1587,6 +1733,7 @@ def _measure_once(
         context,
         tolerance,
         near_context,
+        off_by_one,
     )
     row = _sample_metrics(results, wall_seconds, sample_index + 1)
     prompt_range = row["prompt_tokens_per_stream"]
@@ -1616,6 +1763,7 @@ def _measure(
     gate_cmd: str | None = None,
     min_samples: int | None = None,
     agreement: float | None = None,
+    off_by_one: bool = False,
 ) -> dict:
     initial = min(min_samples or samples, samples)
     rows = [
@@ -1632,6 +1780,7 @@ def _measure(
             target_prompt=target_prompt,
             near_context=near_context,
             gate_cmd=gate_cmd,
+            off_by_one=off_by_one,
         )
         for sample_index in range(initial)
     ]
@@ -1658,6 +1807,7 @@ def _measure(
                 target_prompt=target_prompt,
                 near_context=near_context,
                 gate_cmd=gate_cmd,
+                off_by_one=off_by_one,
             )
         )
     return _summarize_measurements(streams, rows)
@@ -1675,6 +1825,7 @@ def _measure_family(
     prompt_lines: int | None = None,
     target_prompt: int | None = None,
     near_context: bool = False,
+    off_by_one: bool = False,
 ) -> dict:
     rows = {stream_count: [] for stream_count in streams}
 
@@ -1695,6 +1846,7 @@ def _measure_family(
                     target_prompt=target_prompt,
                     near_context=near_context,
                     gate_cmd=settings.gate_cmd,
+                    off_by_one=off_by_one,
                 )
             )
 
@@ -2230,11 +2382,48 @@ def run_benchmark(
 
     print("warmup:")
     warmup = request("Reply with the single word ok.", 1, 1)
-    if warmup.output_tokens != 1:
+    token_accounting = None
+    if settings.tolerate_off_by_one:
+        print("token accounting probe:")
+        token_accounting = _probe_token_accounting(request)
+        print(
+            f"  applied={token_accounting['applied']} "
+            f"{token_accounting['note']}"
+        )
+        settings = replace(settings, token_accounting=token_accounting)
+    off_by_one = bool(token_accounting and token_accounting["applied"])
+    warmup_expected = 0 if off_by_one else 1
+    if warmup.output_tokens != warmup_expected:
+        hint = ""
+        if warmup.output_tokens == warmup_expected - 1:
+            if settings.tolerate_off_by_one:
+                evidence = (settings.token_accounting or {}).get(
+                    "evidence"
+                ) or []
+                reported = [item.get("reported") for item in evidence]
+                reasons = [
+                    item.get("finish_reason") for item in evidence
+                ]
+                hint = (
+                    " The off-by-one tolerance was requested, but the "
+                    "characterization probe did not confirm it (probes "
+                    f"reported {reported} with finish reasons {reasons}); "
+                    "validation stays strict, so this backend does not "
+                    "meet the protocol."
+                )
+            else:
+                hint = (
+                    " The reported count is exactly one below the "
+                    "expectation; if this backend decodes one token short "
+                    "at the limit, set AUDIT_BENCH_TOLERATE_OFF_BY_ONE=1 "
+                    "(docs/PROTOCOL.md)."
+                )
         raise RuntimeError(
-            "warmup did not return exactly one output token; "
+            f"warmup did not return exactly {warmup_expected} output "
+            f"token{'s' if warmup_expected != 1 else ''}; "
             f"endpoint reported {warmup.output_tokens} for model {model!r} "
             "(backends must honor max_tokens exactly)"
+            f"{hint}"
         )
 
     if settings.profile == "decode":
@@ -2248,6 +2437,7 @@ def run_benchmark(
             output_tokens=settings.output_tokens,
             context=context,
             variant_base=200000,
+            off_by_one=off_by_one,
         )
         _emit(
             {
@@ -2327,6 +2517,7 @@ def run_benchmark(
             gate_cmd=settings.gate_cmd,
             min_samples=settings.min_samples,
             agreement=settings.sample_agreement,
+            off_by_one=off_by_one,
         )
 
     near_plan = plan["capacity_near"]
@@ -2343,6 +2534,7 @@ def run_benchmark(
         prompt_lines=calibration.lines_for(near_plan["target_prompt_tokens"]),
         target_prompt=near_plan["target_prompt_tokens"],
         near_context=True,
+        off_by_one=off_by_one,
     )
     print("decode ceiling:")
     decode = _measure_family(
@@ -2354,6 +2546,7 @@ def run_benchmark(
         output_tokens=settings.output_tokens,
         context=context,
         variant_base=200000,
+        off_by_one=off_by_one,
     )
     audits = {}
     for index, phase in enumerate(plan["audit_phases"]):
@@ -2373,6 +2566,7 @@ def run_benchmark(
                 variant_base=300000 + index * 100000,
                 prompt_lines=calibration.lines_for(target),
                 target_prompt=target,
+                off_by_one=off_by_one,
             ),
         }
     result = {
