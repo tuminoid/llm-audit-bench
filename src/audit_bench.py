@@ -1742,7 +1742,11 @@ def run_benchmark(
     print("warmup:")
     warmup = request("Reply with the single word ok.", 1, 1)
     if warmup.output_tokens != 1:
-        raise RuntimeError("warmup did not return exactly one output token")
+        raise RuntimeError(
+            "warmup did not return exactly one output token; "
+            f"endpoint reported {warmup.output_tokens} for model {model!r} "
+            "(backends must honor max_tokens exactly)"
+        )
 
     if settings.profile == "decode":
         print("decode ceiling:")
