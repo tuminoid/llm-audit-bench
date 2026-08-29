@@ -11,6 +11,7 @@ from unittest import mock
 
 from audit_bench import (
     Calibration,
+    OpenAIChatAdapter,
     RequestResult,
     Settings,
     _conversation_fixture,
@@ -739,6 +740,51 @@ class AuditBenchTest(unittest.TestCase):
             os.environ, {"AUDIT_BENCH_SYSTEM_PROMPT": control}, clear=False
         ):
             self.assertTrue(Settings.from_env().canonical)
+
+    def test_reasoning_effort_is_recorded_and_stays_canonical(self):
+        result, text = self._run_fake_protocol(
+            {"AUDIT_BENCH_REASONING_EFFORT": "none"}
+        )
+        self.assertEqual(result, 0)
+        report = json.loads(text.splitlines()[-1])
+        self.assertEqual(report["settings"]["reasoning_effort"], "none")
+        with mock.patch.dict(
+            os.environ, {"AUDIT_BENCH_REASONING_EFFORT": "none"}, clear=False
+        ):
+            self.assertTrue(Settings.from_env().canonical)
+
+    def test_adapter_sends_reasoning_effort_only_when_set(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, t, e, tb):
+                    return False
+
+                def read(self):
+                    return json.dumps(
+                        {"usage": {"prompt_tokens": 5, "completion_tokens": 1}}
+                    )
+
+            return _Resp()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            OpenAIChatAdapter(
+                "http://127.0.0.1:1", "m", 10, reasoning_effort="none"
+            )("hi", 1, 0)
+        body = json.loads(captured["request"].data.decode())
+        self.assertEqual(body["reasoning_effort"], "none")
+
+        captured.clear()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            OpenAIChatAdapter("http://127.0.0.1:1", "m", 10)("hi", 1, 0)
+        body = json.loads(captured["request"].data.decode())
+        self.assertNotIn("reasoning_effort", body)
 
 
 class CliMainTest(unittest.TestCase):

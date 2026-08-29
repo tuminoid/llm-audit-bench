@@ -100,15 +100,26 @@ system message -- is permitted configuration, not a workload change:
   disqualify the run.
 - The workload text stays byte-identical; the control rides in the system
   role (or the runtime's equivalent documented parameter).
-- The setting is recorded in the run's JSON settings
-  (`AUDIT_BENCH_SYSTEM_PROMPT`, exported by the adapter from the model
-  config) and stated in the benchmark document entry. It does not mark the
+- The setting is recorded in the run's JSON settings --
+  `AUDIT_BENCH_SYSTEM_PROMPT` for the system-role control,
+  `AUDIT_BENCH_REASONING_EFFORT` for a documented parameter -- and
+  stated in the benchmark document entry. It does not mark the
   run `canonical: false` -- models already differ in their template-default
   reasoning behavior inside the same token budgets, and this control pins
   that same axis explicitly.
 - A model that cannot reach the fixed token count even under its documented
   control is recorded as protocol-incompatible, not bench-marked with a
   shorter workload.
+
+The system-role path above is the original mechanism. The parameter path
+(`AUDIT_BENCH_REASONING_EFFORT`, sent as the request `reasoning_effort`
+field) was added for runtimes whose documented control is a parameter --
+LM Studio, vLLM, and OpenAI all document `reasoning_effort`, and strongly
+reasoning-default models such as Qwen3 need it to emit a non-empty answer
+at all. The workload text and the canonical settings table are unchanged,
+and the control does not affect `canonical`, so existing results remain
+comparable; the only output change is a new `settings.reasoning_effort`
+key, hence `SCHEMA_VERSION` 3.
 
 Before measuring, each adapter verifies the live model identity, configured
 context, and active slot count where the runtime exposes them. A forgotten

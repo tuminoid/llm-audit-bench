@@ -237,6 +237,7 @@ class Settings:
     conv_max_steps: int = DEFAULT_CONV_MAX_STEPS
     gate_cmd: str | None = None
     system_prompt: str | None = None
+    reasoning_effort: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -332,10 +333,15 @@ class Settings:
             tolerance=tolerance,
             dry_run=os.environ.get("AUDIT_BENCH_DRY_RUN", "0") == "1",
             gate_cmd=os.environ.get("AUDIT_BENCH_GATE_CMD") or None,
-            # A model-documented reasoning-effort control (docs/PROTOCOL.md
-            # "Model-documented decode-compliance controls"). Recorded
-            # configuration; the workload text itself never changes.
+            # Model-documented reasoning-effort controls (docs/PROTOCOL.md
+            # "Model-documented decode-compliance controls"). The control may
+            # ride in the system role (system_prompt) or the runtime's
+            # documented parameter (reasoning_effort). Recorded configuration
+            # only; the workload text itself never changes, and neither marks
+            # the run non-canonical.
             system_prompt=os.environ.get("AUDIT_BENCH_SYSTEM_PROMPT") or None,
+            reasoning_effort=os.environ.get("AUDIT_BENCH_REASONING_EFFORT")
+            or None,
         )
 
     @property
@@ -618,10 +624,17 @@ class Calibration:
 class OpenAIChatAdapter:
     """OpenAI-compatible chat-completions adapter used by both vLLM runtimes."""
 
-    def __init__(self, base_url: str, model: str, timeout: int):
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout: int,
+        reasoning_effort: str | None = None,
+    ):
         self.url = f"{base_url.rstrip('/')}/v1/chat/completions"
         self.model = model
         self.timeout = timeout
+        self.reasoning_effort = reasoning_effort
 
     def __call__(self, prompt: str, max_tokens: int, seed: int) -> RequestResult:
         payload = {
@@ -632,6 +645,8 @@ class OpenAIChatAdapter:
             "seed": seed,
             "ignore_eos": True,
         }
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         request = urllib.request.Request(
             self.url,
             data=json.dumps(payload).encode(),
@@ -824,7 +839,9 @@ def _summarize_measurements(streams: int, rows: list[dict]) -> dict:
     }
 
 
-def openai_chat_fn(base_url: str, model: str, timeout: int) -> Callable:
+def openai_chat_fn(
+    base_url: str, model: str, timeout: int, reasoning_effort: str | None = None
+) -> Callable:
     """Build a chat callable against an OpenAI-compatible /v1 endpoint.
 
     Used by the conversation profile, which needs multi-message requests
@@ -833,13 +850,16 @@ def openai_chat_fn(base_url: str, model: str, timeout: int) -> Callable:
     endpoint = base_url.rstrip("/") + "/chat/completions"
 
     def chat(messages: list[dict], tools: list[dict], max_tokens: int) -> dict:
-        payload = json.dumps({
+        body: dict = {
             "model": model,
             "messages": messages,
             "tools": tools,
             "temperature": 0,
             "max_tokens": max_tokens,
-        }).encode()
+        }
+        if reasoning_effort is not None:
+            body["reasoning_effort"] = reasoning_effort
+        payload = json.dumps(body).encode()
         request = urllib.request.Request(
             endpoint, payload, {"Content-Type": "application/json"}
         )
@@ -2034,6 +2054,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         os.environ["AUDIT_BENCH_DRY_RUN"] = "1"
     dry_run = os.environ.get("AUDIT_BENCH_DRY_RUN", "0") == "1"
+    # Documented reasoning-effort control (docs/PROTOCOL.md) forwarded to the
+    # adapters so it is both sent with every request and recorded in the JSON.
+    reasoning_effort = os.environ.get("AUDIT_BENCH_REASONING_EFFORT") or None
 
     active_slots = _cli_capacity(
         args.active_slots,
@@ -2081,7 +2104,9 @@ def main(argv: list[str] | None = None) -> int:
         request=(
             None
             if dry_run
-            else OpenAIChatAdapter(args.base_url, model, args.timeout)
+            else OpenAIChatAdapter(
+                args.base_url, model, args.timeout, reasoning_effort=reasoning_effort
+            )
         ),
         active_slots=active_slots,
         kv_pool_tokens=kv_pool_tokens,
@@ -2098,7 +2123,9 @@ def main(argv: list[str] | None = None) -> int:
         openai_chat=(
             None
             if dry_run
-            else openai_chat_fn(args.base_url, model, args.timeout)
+            else openai_chat_fn(
+                args.base_url, model, args.timeout, reasoning_effort=reasoning_effort
+            )
         ),
     )
 
