@@ -298,6 +298,64 @@ performs; conversations/hour and replays/hour are different quantities
 (probe turns decode almost nothing) and must never be compared across
 the two profiles.
 
+### Concurrent audit replay
+
+`AUDIT_BENCH_PROFILE=replay-concurrent` measures the multi-agent audit
+shape: N scripted replays running at once against one server, sharing
+the evidence prefix and competing for the same KV pool. Within one
+sample batch every stream carries the identical system message,
+evidence, and opening turn -- concurrent agents working the same
+repository -- so a prefix cache may share their evidence; each stream's
+file chain diverges from its first tool result, so the growing suffixes
+are distinct work. Across samples and stream counts the evidence
+changes from the first token, keeping every batch cold at start.
+
+Two deliberate differences from the 1x replay profile:
+
+- Probe turns decode a realistic agent turn instead of a 32-token
+  prefill probe: the measured call appends an ephemeral decode-control
+  user message and caps output at `AUDIT_BENCH_CONV_TURN_TOKENS`
+  (canonical 1,024, the protocol's normal output size). The control
+  never enters the transcript and the probe output is still discarded,
+  so the resent prefix stays byte-identical across models and runtimes.
+  Recorded per-turn completion tokens expose a model that ignores the
+  control instead of flattering its rate.
+- Streams start together on a barrier and then free-run their own turn
+  loops with no per-turn synchronization, so natural desync develops
+  exactly as independent agents drift apart. First-turn cached tokens
+  are recorded per stream: whichever stream commits the shared evidence
+  first seeds the cache for the rest, and partial first-turn sharing
+  under a simultaneous start is a real property of agents starting
+  together, measured rather than staggered away.
+
+Candidate stream counts are the deep-context candidates (1, 2, 4).
+Fitting counts are conservative: per-stream KV demand is the final
+resent conversation plus the verdict cap, with no shared-prefix credit,
+so admission never depends on cache behavior and counts above the bound
+are never submitted.
+
+| Setting | Canonical value |
+| -- | --: |
+| `AUDIT_BENCH_CONV_TURN_TOKENS` | 1,024 |
+| Candidate streams | 1, 2, 4 |
+| Other settings | as audit conversation |
+
+Reported metrics per stream count: batch wall seconds, aggregate
+replays/hour (streams times 3600 over batch wall), scaling versus the
+in-family 1x, first- and final-turn walls, verdict output
+tokens/second, median per-turn completion tokens, median cached
+fraction, and per-stream first-turn cached tokens. The in-family 1x
+point decodes full turns, so it is a different quantity from the 1x
+replay profile: never compare replays/hour across the two. As with
+replay, a result without the server's resolved prefix-caching state is
+meaningless.
+
+Amendment (2026-08-29): the replay-concurrent profile was added
+alongside the existing profiles, which are unchanged; existing replay
+and conversation results remain valid and comparable. `SCHEMA_VERSION`
+was bumped to 3 for the new `audit_replay_concurrent` result section
+and `replay_concurrent` plan block.
+
 ### End-to-end audit calls
 
 These phases include both prompt processing and generation in wall time:

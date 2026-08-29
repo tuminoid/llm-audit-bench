@@ -13,10 +13,12 @@ from audit_bench import (
     Calibration,
     RequestResult,
     Settings,
+    _conversation_fixture,
     _file_provenance,
     _measure,
     _measure_conversations,
     _measure_family,
+    _measure_replay_concurrent,
     _measure_replays,
     _publication_status,
     audit_prompt,
@@ -414,6 +416,120 @@ class AuditBenchTest(unittest.TestCase):
         ):
             self.assertTrue(Settings.from_env().canonical)
 
+    def test_replay_concurrent_profile_is_canonical_at_defaults(self):
+        with mock.patch.dict(
+            os.environ,
+            {"AUDIT_BENCH_PROFILE": "replay-concurrent"},
+            clear=False,
+        ):
+            self.assertTrue(Settings.from_env().canonical)
+        with mock.patch.dict(
+            os.environ,
+            {"AUDIT_BENCH_PROFILE": "replay-concurrent",
+             "AUDIT_BENCH_CONV_TURN_TOKENS": "256"},
+            clear=False,
+        ):
+            self.assertFalse(Settings.from_env().canonical)
+
+    def test_plan_includes_replay_concurrent_block(self):
+        plan = build_plan(262144, settings(), 8, 2748350)
+        block = plan["replay_concurrent"]
+        self.assertEqual(block["steps"], 16)
+        self.assertEqual(block["turn_output_tokens"], 1024)
+        # 32,768 + 16 * (8,192 + 256) + 16,384 per stream, no
+        # shared-prefix credit.
+        self.assertEqual(block["per_stream_kv_demand"], 184320)
+        self.assertEqual(block["streams"], [1, 2, 4])
+
+    def test_replay_concurrent_streams_respect_pool_and_slots(self):
+        # A 611k pool holds three per-stream demands; the deep-stream
+        # candidates prune to 1 and 2.
+        plan = build_plan(262144, settings(), 5, 611156)
+        self.assertEqual(plan["replay_concurrent"]["streams"], [1, 2])
+        # One-slot admission runs 1x only regardless of pool size.
+        plan = build_plan(262144, settings(), 1, 2748350)
+        self.assertEqual(plan["replay_concurrent"]["streams"], [1])
+
+    def test_replay_concurrent_fixture_shares_evidence_diverges_chains(self):
+        conv = self._conversation_settings(profile="replay-concurrent")
+        calibration = Calibration(
+            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
+        )
+        steps_a, evidence_a, _, files_a = _conversation_fixture(
+            calibration, 131072, conv, 900000, 901000
+        )
+        steps_b, evidence_b, _, files_b = _conversation_fixture(
+            calibration, 131072, conv, 900000, 902000
+        )
+        self.assertEqual(steps_a, steps_b)
+        # Same repository context: the shared evidence prefix is
+        # byte-identical, so concurrent agents can share the cache.
+        self.assertEqual(evidence_a, evidence_b)
+        # Same file names, divergent contents: distinct work per agent.
+        self.assertEqual(list(files_a), list(files_b))
+        self.assertNotEqual(files_a["file_001"], files_b["file_001"])
+
+    @staticmethod
+    def _fake_concurrent_chat(requests: list):
+        """Stateless thread-safe fake deriving usage from the messages."""
+
+        def chat(messages, tools, max_tokens):
+            del tools
+            requests.append(([dict(item) for item in messages], max_tokens))
+            time.sleep(0.01)
+            prompt = 500 * len(messages)
+            usage = {"prompt_tokens": prompt, "completion_tokens": max_tokens}
+            if len(messages) > 3:
+                usage["prompt_tokens_details"] = {
+                    "cached_tokens": prompt - 400
+                }
+            message = {"content": "x", "tool_calls": []}
+            return {
+                "choices": [{"message": message, "finish_reason": "length"}],
+                "usage": usage,
+            }
+
+        return chat
+
+    def test_replay_concurrent_measures_shared_prefix_batches(self):
+        conv = self._conversation_settings(profile="replay-concurrent")
+        calibration = Calibration(
+            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
+        )
+        requests: list = []
+        chat = self._fake_concurrent_chat(requests)
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_replay_concurrent(
+                chat, calibration, 131072, conv, (1, 2)
+            )
+        self.assertEqual(set(measured["by_streams"]), {"1", "2"})
+        two = measured["by_streams"]["2"]
+        self.assertEqual(len(two["samples"]), 2)
+        self.assertGreater(two["replays_per_hour"]["median"], 0)
+        self.assertIn("2", measured["scaling_vs_1x"])
+        self.assertEqual(
+            two["turn_completion_tokens_median"], conv.conv_turn_tokens
+        )
+        # Probe turns decode to the turn cap under an ephemeral control
+        # riding at the end of the measured call only.
+        probes = [item for item in requests
+                  if item[1] == conv.conv_turn_tokens]
+        self.assertTrue(probes)
+        for messages, _ in probes:
+            self.assertEqual(messages[-1]["role"], "user")
+            self.assertIn("BENCHMARK CONTROL", messages[-1]["content"])
+        # The ephemeral control never enters the transcript: verdict
+        # requests carry exactly one control, the permanent verdict one.
+        verdicts = [item for item in requests
+                    if item[1] == conv.conv_output_tokens]
+        self.assertEqual(len(verdicts), 6)
+        for messages, _ in verdicts:
+            controls = [
+                item for item in messages
+                if "BENCHMARK CONTROL" in (item.get("content") or "")
+            ]
+            self.assertEqual(len(controls), 1)
+
     def test_plan_includes_replay_block(self):
         plan = build_plan(262144, settings(), 2, 2748350)
         self.assertEqual(plan["replay"]["steps"], 16)
@@ -551,7 +667,7 @@ class AuditBenchTest(unittest.TestCase):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
         self.assertEqual(result, 0)
         report = json.loads(text.splitlines()[-1])
-        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["schema_version"], 3)
         self.assertEqual(report["protocol"], "audit-v1")
         self.assertFalse(report["publishable"])
         self.assertIn("capacity_near", report)

@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 PROTOCOL = "audit-v1"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 COMMON_PREFILL_TARGETS = (32768, 65536, 131072)
 DEFAULT_STREAMS = (1, 2, 4, 8)
 DEFAULT_DEEP_STREAMS = (1, 2, 4)
@@ -42,6 +42,11 @@ DEFAULT_TOLERANCE = 0.02
 DEFAULT_CONV_EVIDENCE_TOKENS = 32768
 DEFAULT_CONV_TOOL_TOKENS = 8192
 DEFAULT_CONV_OUTPUT_TOKENS = 16384
+# Concurrent replay probe turns decode a realistic agent turn (analysis
+# plus a tool call) instead of the 32-token prefill probe; 1,024 is the
+# protocol's canonical normal output size, shared with decode and
+# audit_32k, so per-turn decode contention is part of the measurement.
+DEFAULT_CONV_TURN_TOKENS = 1024
 # Assistant notes are short and reasoning is never resent, so context
 # fit reserves only a note-sized slice per turn, not the output cap.
 CONV_NOTE_RESERVE = 256
@@ -228,6 +233,7 @@ class Settings:
     conv_evidence_tokens: int = DEFAULT_CONV_EVIDENCE_TOKENS
     conv_tool_tokens: int = DEFAULT_CONV_TOOL_TOKENS
     conv_output_tokens: int = DEFAULT_CONV_OUTPUT_TOKENS
+    conv_turn_tokens: int = DEFAULT_CONV_TURN_TOKENS
     conv_max_steps: int = DEFAULT_CONV_MAX_STEPS
     gate_cmd: str | None = None
     system_prompt: str | None = None
@@ -235,10 +241,12 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         profile = os.environ.get("AUDIT_BENCH_PROFILE", "full")
-        if profile not in {"full", "decode", "conversation", "replay"}:
+        if profile not in {
+            "full", "decode", "conversation", "replay", "replay-concurrent"
+        }:
             raise ValueError(
                 "AUDIT_BENCH_PROFILE must be full, decode, conversation, "
-                "or replay"
+                "replay, or replay-concurrent"
             )
         tolerance_raw = os.environ.get(
             "AUDIT_BENCH_TARGET_TOLERANCE", str(DEFAULT_TOLERANCE)
@@ -287,6 +295,9 @@ class Settings:
         conv_output = _positive_int(
             "AUDIT_BENCH_CONV_OUTPUT_TOKENS", DEFAULT_CONV_OUTPUT_TOKENS
         )
+        conv_turn = _positive_int(
+            "AUDIT_BENCH_CONV_TURN_TOKENS", DEFAULT_CONV_TURN_TOKENS
+        )
         conv_max_steps = _positive_int(
             "AUDIT_BENCH_CONV_MAX_STEPS", DEFAULT_CONV_MAX_STEPS
         )
@@ -310,6 +321,7 @@ class Settings:
             conv_evidence_tokens=conv_evidence,
             conv_tool_tokens=conv_tool,
             conv_output_tokens=conv_output,
+            conv_turn_tokens=conv_turn,
             conv_max_steps=conv_max_steps,
             output_tokens=_positive_int(
                 "AUDIT_BENCH_OUTPUT_TOKENS", DEFAULT_OUTPUT_TOKENS
@@ -328,17 +340,21 @@ class Settings:
 
     @property
     def canonical(self) -> bool:
-        # Three fixed protocol workloads exist: the full cache-neutral phase
-        # set, the interactive audit conversation (model usability), and
-        # the scripted audit replay (server performance). Each is canonical
-        # at its own defaults; decode remains a tuning aid.
+        # Four fixed protocol workloads exist: the full cache-neutral phase
+        # set, the interactive audit conversation (model usability), the
+        # scripted audit replay (server performance), and the concurrent
+        # audit replay (multi-agent contention over a shared prefix). Each
+        # is canonical at its own defaults; decode remains a tuning aid.
         return (
             self.streams == DEFAULT_STREAMS
             and self.deep_streams == DEFAULT_DEEP_STREAMS
-            and self.profile in ("full", "conversation", "replay")
+            and self.profile in (
+                "full", "conversation", "replay", "replay-concurrent"
+            )
             and self.conv_evidence_tokens == DEFAULT_CONV_EVIDENCE_TOKENS
             and self.conv_tool_tokens == DEFAULT_CONV_TOOL_TOKENS
             and self.conv_output_tokens == DEFAULT_CONV_OUTPUT_TOKENS
+            and self.conv_turn_tokens == DEFAULT_CONV_TURN_TOKENS
             and self.conv_max_steps == DEFAULT_CONV_MAX_STEPS
             and self.samples == DEFAULT_SAMPLES
             and self.min_samples == DEFAULT_MIN_SAMPLES
@@ -375,6 +391,36 @@ def _fitting_streams(
 
 def _endpoints(streams: list[int]) -> list[int]:
     return [1] if streams[-1] == 1 else [1, streams[-1]]
+
+
+def _replay_concurrent_streams(
+    context: int,
+    settings: Settings,
+    active_slots: int,
+    kv_pool_tokens: int,
+) -> tuple[int, list[int]]:
+    """Fitting concurrent-replay stream counts and the per-stream demand.
+
+    Demand is the final resent conversation plus the verdict cap. No
+    shared-prefix credit is taken even though concurrent streams share
+    their evidence prefix, so admission never depends on cache behavior.
+    A single replay always fits: the step fit keeps the final prompt
+    plus verdict output within one configured context, and the pool
+    holds at least one context.
+    """
+    steps = conversation_steps(context, settings)
+    per_stream = (
+        settings.conv_evidence_tokens
+        + steps * (settings.conv_tool_tokens + CONV_NOTE_RESERVE)
+        + settings.conv_output_tokens
+    )
+    max_streams = min(active_slots, kv_pool_tokens // per_stream)
+    fitting = [
+        candidate
+        for candidate in settings.deep_streams
+        if candidate <= max_streams
+    ]
+    return per_stream, fitting or [1]
 
 
 def build_plan(
@@ -426,6 +472,9 @@ def build_plan(
             near_target,
             1,
         )
+    )
+    replay_demand, replay_concurrent_streams = _replay_concurrent_streams(
+        context, settings, active_slots, kv_pool_tokens
     )
     prefill_targets = [
         target
@@ -497,6 +546,15 @@ def build_plan(
             "verdict_output_tokens": settings.conv_output_tokens,
             "steps": conversation_steps(context, settings),
             "streams": [1],
+        },
+        "replay_concurrent": {
+            "evidence_tokens": settings.conv_evidence_tokens,
+            "tool_result_tokens": settings.conv_tool_tokens,
+            "turn_output_tokens": settings.conv_turn_tokens,
+            "verdict_output_tokens": settings.conv_output_tokens,
+            "steps": conversation_steps(context, settings),
+            "per_stream_kv_demand": replay_demand,
+            "streams": replay_concurrent_streams,
         },
     }
 
@@ -822,13 +880,19 @@ def _conversation_fixture(
     context: int,
     settings: Settings,
     variant: int,
+    chain_variant: int | None = None,
 ) -> tuple[int, str, dict, dict]:
     """Deterministic evidence corpus shared by conversation and replay.
 
     Returns (steps, evidence, findings, files). Samples differ from the
     first token via the variant, so only self-sharing within one
-    conversation can hit a cache.
+    conversation can hit a cache. The concurrent replay passes a
+    per-stream chain_variant with a shared evidence variant: streams
+    then present the identical evidence prefix (concurrent agents on
+    the same repository) while their file chains diverge from the first
+    tool result.
     """
+    chain = variant if chain_variant is None else chain_variant
     steps = conversation_steps(context, settings)
     evidence = audit_prompt(
         calibration.lines_for(settings.conv_evidence_tokens), variant,
@@ -842,13 +906,13 @@ def _conversation_fixture(
         return f"\nNEXT EVIDENCE FILE: file_{n + 1:03d}"
 
     findings = {
-        f"file_{n:03d}": f"issue-{variant + n}-{(variant + n) % 97:02d}"
+        f"file_{n:03d}": f"issue-{chain + n}-{(chain + n) % 97:02d}"
         for n in range(1, steps + 1)
     }
     files = {
         name: (
             f"TOOL RESULT {name}\n"
-            + audit_prompt(tool_lines, variant + n, output_control=False)
+            + audit_prompt(tool_lines, chain + n, output_control=False)
             + f"\nFINDING: {findings[name]}"
             + _chain_note(n)
         )
@@ -1027,12 +1091,15 @@ def _measure_conversations(
     return result
 
 
-def _run_replay(
+def _replay_once(
     chat: Callable,
     calibration: "Calibration",
     context: int,
     settings: Settings,
-    sample_index: int,
+    evidence_variant: int,
+    chain_variant: int,
+    probe_tokens: int,
+    probe_control: bool,
 ) -> dict:
     """One scripted audit conversation: the harness drives every turn.
 
@@ -1042,22 +1109,31 @@ def _run_replay(
     every runtime produces the identical resend-everything shape -- a
     model that cannot hold the interactive protocol still yields prefill
     and cache numbers. The model is still called once per turn (that call
-    is the measurement); its probe output is capped small and discarded,
-    never appended. The final verdict turn forces a full-cap decode at
-    depth via the standard output control, so its wall time is the
-    end-to-end cost of producing a verdict on this server.
+    is the measurement); its probe output is capped and discarded, never
+    appended. With probe_control the measured call carries an ephemeral
+    decode-control user message so the model decodes a realistic agent
+    turn to the cap; the control never enters the transcript, keeping
+    the resent prefix byte-identical across models and runtimes. The
+    final verdict turn forces a full-cap decode at depth via the
+    standard output control, so its wall time is the end-to-end cost of
+    producing a verdict on this server.
     """
-    _wait_for_gate(settings.gate_cmd)
-    variant = 800000 + sample_index * 1000
     steps, evidence, _, files = _conversation_fixture(
-        calibration, context, settings, variant
+        calibration, context, settings, evidence_variant, chain_variant
     )
     messages = _opening_messages(steps, evidence)
+    control_message = {
+        "role": "user",
+        "content": f"BENCHMARK CONTROL: {OUTPUT_CONTROL}",
+    }
     per_step = []
     started = time.monotonic()
     for turn, name in enumerate(files):
+        probe_messages = (
+            messages + [control_message] if probe_control else messages
+        )
         turn_started = time.monotonic()
-        response = chat(messages, CONV_TOOLS, REPLAY_PROBE_TOKENS)
+        response = chat(probe_messages, CONV_TOOLS, probe_tokens)
         wall = time.monotonic() - turn_started
         usage = response.get("usage") or {}
         per_step.append({
@@ -1101,7 +1177,6 @@ def _run_replay(
     if verdict_cached is not None:
         cached_rows.append(verdict_cached)
     row = {
-        "sample": sample_index + 1,
         "steps": steps,
         "wall_seconds": total,
         "replays_per_hour": 3600 / total if total else 0,
@@ -1124,15 +1199,228 @@ def _run_replay(
         ),
         "per_step": per_step,
     }
+    return row
+
+
+def _run_replay(
+    chat: Callable,
+    calibration: "Calibration",
+    context: int,
+    settings: Settings,
+    sample_index: int,
+) -> dict:
+    """One 1x replay sample: prefill-probe turns, gated and reported."""
+    _wait_for_gate(settings.gate_cmd)
+    variant = 800000 + sample_index * 1000
+    row = _replay_once(
+        chat,
+        calibration,
+        context,
+        settings,
+        evidence_variant=variant,
+        chain_variant=variant,
+        probe_tokens=REPLAY_PROBE_TOKENS,
+        probe_control=False,
+    )
+    row["sample"] = sample_index + 1
     cached = row["cached_fraction"]
     print(
-        f"  replay           sample={sample_index + 1} steps={steps} "
-        f"wall={total:.1f}s first-turn={row['first_turn_wall_seconds']:.1f}s "
+        f"  replay           sample={sample_index + 1} "
+        f"steps={row['steps']} "
+        f"wall={row['wall_seconds']:.1f}s "
+        f"first-turn={row['first_turn_wall_seconds']:.1f}s "
         f"final-turn={row['final_turn_wall_seconds']:.1f}s "
-        f"verdict={verdict_completion:,}tok/{verdict_wall:.1f}s "
+        f"verdict={row['verdict_completion_tokens']:,}tok/"
+        f"{row['verdict_wall_seconds']:.1f}s "
         f"cached={cached if cached is None else round(cached, 3)}"
     )
     return row
+
+
+def _run_replay_concurrent(
+    chat: Callable,
+    calibration: "Calibration",
+    context: int,
+    settings: Settings,
+    streams: int,
+    sample_index: int,
+) -> dict:
+    """One concurrent batch: N scripted replays over a shared prefix.
+
+    All streams carry the sample's evidence variant -- the same
+    repository context concurrent agents would present -- while each
+    stream's file chain diverges from its first tool result. Streams
+    start together on a barrier and then free-run their own turn loops;
+    no per-turn synchronization exists, so natural desync develops
+    exactly as independent agents drift apart. Probe turns decode a
+    realistic agent turn under an ephemeral control, so per-turn decode
+    contention is part of the measurement. Across samples and stream
+    counts the evidence changes from the first token, keeping every
+    batch cold at start.
+    """
+    _wait_for_gate(settings.gate_cmd)
+    evidence_variant = 900000 + sample_index * 100000 + streams * 10000
+    barrier = threading.Barrier(streams + 1)
+
+    def worker(stream_index: int) -> dict:
+        barrier.wait()
+        return _replay_once(
+            chat,
+            calibration,
+            context,
+            settings,
+            evidence_variant=evidence_variant,
+            chain_variant=evidence_variant + (stream_index + 1) * 1000,
+            probe_tokens=settings.conv_turn_tokens,
+            probe_control=True,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=streams
+    ) as executor:
+        futures = [executor.submit(worker, index) for index in range(streams)]
+        started = time.monotonic()
+        barrier.wait()
+        stream_rows = [future.result() for future in futures]
+    wall = time.monotonic() - started
+
+    first_turn_cached = [
+        row["per_step"][0]["cached_tokens"] for row in stream_rows
+    ]
+    cached_known = [value for value in first_turn_cached if value is not None]
+    fractions = [
+        row["cached_fraction"]
+        for row in stream_rows
+        if row["cached_fraction"] is not None
+    ]
+    turn_completions = [
+        step["completion_tokens"] or 0
+        for row in stream_rows
+        for step in row["per_step"]
+    ]
+    row = {
+        "sample": sample_index + 1,
+        "streams": streams,
+        "steps": stream_rows[0]["steps"],
+        "wall_seconds": wall,
+        "replays_per_hour": streams * 3600 / wall if wall else 0,
+        "first_turn_wall_seconds": statistics.median(
+            [item["first_turn_wall_seconds"] for item in stream_rows]
+        ),
+        "final_turn_wall_seconds": statistics.median(
+            [item["final_turn_wall_seconds"] for item in stream_rows]
+        ),
+        "verdict_output_tokens_per_second": statistics.median(
+            [item["verdict_output_tokens_per_second"] for item in stream_rows]
+        ),
+        "turn_completion_tokens_median": statistics.median(turn_completions),
+        # Whichever stream commits the shared evidence first seeds the
+        # cache for the rest; the per-stream list keeps that asymmetry
+        # visible instead of averaging it away.
+        "first_turn_cached_tokens": first_turn_cached,
+        "first_turn_cached_tokens_median": (
+            statistics.median(cached_known) if cached_known else None
+        ),
+        "cached_fraction": (
+            statistics.median(fractions) if fractions else None
+        ),
+        "per_stream": stream_rows,
+    }
+    cached = row["cached_fraction"]
+    print(
+        f"  replay_conc      n={streams:<2} sample={sample_index + 1} "
+        f"wall={wall:.1f}s replays={row['replays_per_hour']:.2f}/h "
+        f"first-turn={row['first_turn_wall_seconds']:.1f}s "
+        f"final-turn={row['final_turn_wall_seconds']:.1f}s "
+        f"turn-decode={row['turn_completion_tokens_median']:.0f}tok "
+        f"cached={cached if cached is None else round(cached, 3)}"
+    )
+    return row
+
+
+def _measure_replay_concurrent(
+    chat: Callable,
+    calibration: "Calibration",
+    context: int,
+    settings: Settings,
+    streams: tuple[int, ...],
+) -> dict:
+    """Concurrent replay family over the fitting stream counts."""
+    rows: dict[int, list[dict]] = {count: [] for count in streams}
+
+    def _run_pass(sample_index: int) -> None:
+        order = streams if sample_index % 2 == 0 else tuple(reversed(streams))
+        for stream_count in order:
+            rows[stream_count].append(
+                _run_replay_concurrent(
+                    chat, calibration, context, settings,
+                    stream_count, sample_index,
+                )
+            )
+
+    passes = min(settings.min_samples, settings.samples)
+    for sample_index in range(passes):
+        _run_pass(sample_index)
+    # A full extra pass keeps the alternating stream order symmetric, so
+    # a single disagreeing stream count extends every count.
+    while passes < settings.samples and any(
+        not _samples_agree(rows[count], settings.sample_agreement)
+        for count in streams
+    ):
+        print(
+            f"  replay_conc      samples disagree beyond "
+            f"{settings.sample_agreement:.0%}; extending"
+        )
+        _run_pass(passes)
+        passes += 1
+
+    results = {}
+    for stream_count in streams:
+        batch = rows[stream_count]
+        fractions = [
+            row["cached_fraction"]
+            for row in batch
+            if row["cached_fraction"] is not None
+        ]
+        results[str(stream_count)] = {
+            "streams": stream_count,
+            "samples": batch,
+            "wall_seconds": _median_range(batch, "wall_seconds"),
+            "replays_per_hour": _median_range(batch, "replays_per_hour"),
+            "first_turn_wall_seconds": _median_range(
+                batch, "first_turn_wall_seconds"
+            ),
+            "final_turn_wall_seconds": _median_range(
+                batch, "final_turn_wall_seconds"
+            ),
+            "verdict_output_tokens_per_second": _median_range(
+                batch, "verdict_output_tokens_per_second"
+            ),
+            "turn_completion_tokens_median": statistics.median(
+                [row["turn_completion_tokens_median"] for row in batch]
+            ),
+            "cached_fraction_median": (
+                statistics.median(fractions) if fractions else None
+            ),
+        }
+    one = results["1"]["replays_per_hour"]["median"]
+    scaling = {
+        stream_count: (
+            result["replays_per_hour"]["median"] / one if one else 0
+        )
+        for stream_count, result in results.items()
+    }
+    peak_streams, peak = max(
+        results.items(),
+        key=lambda item: item[1]["replays_per_hour"]["median"],
+    )
+    return {
+        "steps": conversation_steps(context, settings),
+        "by_streams": results,
+        "scaling_vs_1x": scaling,
+        "peak_streams": int(peak_streams),
+        "peak_replays_per_hour": peak["replays_per_hour"]["median"],
+    }
 
 
 def _measure_replays(
@@ -1495,7 +1783,7 @@ def run_benchmark(
         f"{high_lines} lines={high.prompt_tokens:,} tokens"
     )
 
-    if settings.profile in ("conversation", "replay"):
+    if settings.profile in ("conversation", "replay", "replay-concurrent"):
         if openai_chat is None:
             raise ValueError(
                 f"the {settings.profile} profile needs an OpenAI-compatible "
@@ -1507,11 +1795,18 @@ def run_benchmark(
             section = _measure_conversations(
                 openai_chat, calibration, context, settings
             )
-        else:
+        elif settings.profile == "replay":
             print("audit replay:")
             key = "audit_replay"
             section = _measure_replays(
                 openai_chat, calibration, context, settings
+            )
+        else:
+            print("concurrent audit replay:")
+            key = "audit_replay_concurrent"
+            section = _measure_replay_concurrent(
+                openai_chat, calibration, context, settings,
+                tuple(plan["replay_concurrent"]["streams"]),
             )
         print(
             json.dumps(
@@ -1712,7 +2007,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--profile",
-        choices=("full", "decode", "conversation", "replay"),
+        choices=(
+            "full", "decode", "conversation", "replay", "replay-concurrent"
+        ),
         help="workload profile (default full; overrides AUDIT_BENCH_PROFILE)",
     )
     parser.add_argument(
