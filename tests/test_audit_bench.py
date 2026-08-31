@@ -28,6 +28,7 @@ from audit_bench import (
     conversation_steps,
     decode_prompt,
     main,
+    openai_chat_fn,
     parse_streams,
     run_benchmark,
     vllm_capacity,
@@ -785,6 +786,105 @@ class AuditBenchTest(unittest.TestCase):
             OpenAIChatAdapter("http://127.0.0.1:1", "m", 10)("hi", 1, 0)
         body = json.loads(captured["request"].data.decode())
         self.assertNotIn("reasoning_effort", body)
+
+    def test_adapter_sends_system_prompt_only_when_set(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, t, e, tb):
+                    return False
+
+                def read(self):
+                    return json.dumps(
+                        {"usage": {"prompt_tokens": 5, "completion_tokens": 1}}
+                    )
+
+            return _Resp()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            OpenAIChatAdapter(
+                "http://127.0.0.1:1", "m", 10, system_prompt="Control: low"
+            )("hi", 1, 0)
+        body = json.loads(captured["request"].data.decode())
+        self.assertEqual(
+            body["messages"],
+            [
+                {"role": "system", "content": "Control: low"},
+                {"role": "user", "content": "hi"},
+            ],
+        )
+
+        captured.clear()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            OpenAIChatAdapter("http://127.0.0.1:1", "m", 10)("hi", 1, 0)
+        body = json.loads(captured["request"].data.decode())
+        self.assertEqual(body["messages"], [{"role": "user", "content": "hi"}])
+
+    def test_chat_fn_sends_system_prompt_before_workload_messages(self):
+        workload = [
+            {"role": "system", "content": "workload system"},
+            {"role": "user", "content": "turn one"},
+        ]
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["request"] = request
+
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, t, e, tb):
+                    return False
+
+                def read(self):
+                    return json.dumps(
+                        {
+                            "choices": [
+                                {
+                                    "message": {"content": "ok"},
+                                    "finish_reason": "stop",
+                                }
+                            ],
+                            "usage": {
+                                "prompt_tokens": 5,
+                                "completion_tokens": 1,
+                            },
+                        }
+                    )
+
+            return _Resp()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            chat = openai_chat_fn(
+                "http://127.0.0.1:1", "m", 10, system_prompt="Control: low"
+            )
+            chat(list(workload), [], 4)
+        body = json.loads(captured["request"].data.decode())
+        self.assertEqual(
+            body["messages"],
+            [
+                {"role": "system", "content": "Control: low"},
+                {"role": "system", "content": "workload system"},
+                {"role": "user", "content": "turn one"},
+            ],
+        )
+        # The workload's own messages stay byte-identical and in order;
+        # the control message is prepended ahead of them.
+        self.assertEqual(body["messages"][1:], workload)
+
+        captured.clear()
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            chat = openai_chat_fn("http://127.0.0.1:1", "m", 10)
+            chat(list(workload), [], 4)
+        body = json.loads(captured["request"].data.decode())
+        self.assertEqual(body["messages"], workload)
 
 
 class CliMainTest(unittest.TestCase):

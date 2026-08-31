@@ -630,16 +630,25 @@ class OpenAIChatAdapter:
         model: str,
         timeout: int,
         reasoning_effort: str | None = None,
+        system_prompt: str | None = None,
     ):
         self.url = f"{base_url.rstrip('/')}/v1/chat/completions"
         self.model = model
         self.timeout = timeout
         self.reasoning_effort = reasoning_effort
+        self.system_prompt = system_prompt
 
     def __call__(self, prompt: str, max_tokens: int, seed: int) -> RequestResult:
+        # The decode-compliance control (docs/PROTOCOL.md) rides in the
+        # system role; the workload prompt stays byte-identical in the user
+        # role.
+        messages: list[dict] = []
+        if self.system_prompt is not None:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.append({"role": "user", "content": prompt})
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": max_tokens,
             "temperature": 0,
             "seed": seed,
@@ -840,7 +849,11 @@ def _summarize_measurements(streams: int, rows: list[dict]) -> dict:
 
 
 def openai_chat_fn(
-    base_url: str, model: str, timeout: int, reasoning_effort: str | None = None
+    base_url: str,
+    model: str,
+    timeout: int,
+    reasoning_effort: str | None = None,
+    system_prompt: str | None = None,
 ) -> Callable:
     """Build a chat callable against an OpenAI-compatible /v1 endpoint.
 
@@ -850,6 +863,12 @@ def openai_chat_fn(
     endpoint = base_url.rstrip("/") + "/chat/completions"
 
     def chat(messages: list[dict], tools: list[dict], max_tokens: int) -> dict:
+        # The decode-compliance control (docs/PROTOCOL.md) rides in the
+        # system role as a separate message ahead of the workload's own
+        # system message, so the workload text stays byte-identical on
+        # every resent turn.
+        if system_prompt is not None:
+            messages = [{"role": "system", "content": system_prompt}] + messages
         body: dict = {
             "model": model,
             "messages": messages,
@@ -2054,9 +2073,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         os.environ["AUDIT_BENCH_DRY_RUN"] = "1"
     dry_run = os.environ.get("AUDIT_BENCH_DRY_RUN", "0") == "1"
-    # Documented reasoning-effort control (docs/PROTOCOL.md) forwarded to the
-    # adapters so it is both sent with every request and recorded in the JSON.
+    # Documented decode-compliance controls (docs/PROTOCOL.md) forwarded to
+    # the adapters so each is both sent with every request and recorded in
+    # the JSON: the documented parameter and the system-role control.
     reasoning_effort = os.environ.get("AUDIT_BENCH_REASONING_EFFORT") or None
+    system_prompt = os.environ.get("AUDIT_BENCH_SYSTEM_PROMPT") or None
 
     active_slots = _cli_capacity(
         args.active_slots,
@@ -2105,7 +2126,11 @@ def main(argv: list[str] | None = None) -> int:
             None
             if dry_run
             else OpenAIChatAdapter(
-                args.base_url, model, args.timeout, reasoning_effort=reasoning_effort
+                args.base_url,
+                model,
+                args.timeout,
+                reasoning_effort=reasoning_effort,
+                system_prompt=system_prompt,
             )
         ),
         active_slots=active_slots,
@@ -2124,7 +2149,11 @@ def main(argv: list[str] | None = None) -> int:
             None
             if dry_run
             else openai_chat_fn(
-                args.base_url, model, args.timeout, reasoning_effort=reasoning_effort
+                args.base_url,
+                model,
+                args.timeout,
+                reasoning_effort=reasoning_effort,
+                system_prompt=system_prompt,
             )
         ),
     )
