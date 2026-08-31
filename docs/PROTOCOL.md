@@ -1,4 +1,4 @@
-npx -y cc-safety-net@latest update# AuditBench v1
+# AuditBench v1
 
 AuditBench v1 is the canonical serving benchmark for models used by the
 non-interactive security-audit workload. It replaces runtime-specific prompt
