@@ -1,5 +1,6 @@
 import contextlib
 import dataclasses
+import http.client
 import io
 import json
 import os
@@ -7,6 +8,7 @@ import pathlib
 import tempfile
 import time
 import unittest
+import urllib.error
 from unittest import mock
 
 from audit_bench import (
@@ -885,6 +887,46 @@ class AuditBenchTest(unittest.TestCase):
             chat(list(workload), [], 4)
         body = json.loads(captured["request"].data.decode())
         self.assertEqual(body["messages"], workload)
+
+    def test_chat_fn_handles_error_and_choicesless_bodies(self):
+        endpoint = "http://127.0.0.1:1/v1/chat/completions"
+        error = urllib.error.HTTPError(
+            endpoint,
+            500,
+            "server error",
+            http.client.HTTPMessage(),
+            io.BytesIO(b"boom"),
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=error):
+            chat = openai_chat_fn("http://127.0.0.1:1", "m", 10)
+            with self.assertRaises(RuntimeError) as ctx:
+                chat([], [], 1)
+        self.assertIn("500", str(ctx.exception))
+        self.assertIn("boom", str(ctx.exception))
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, t, e, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {"usage": {"prompt_tokens": 1}}
+                ).encode()
+
+        def fake_urlopen(request, timeout=None):
+            del request
+            return _Resp()
+
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=fake_urlopen
+        ):
+            chat = openai_chat_fn("http://127.0.0.1:1", "m", 10)
+            with self.assertRaises(RuntimeError) as ctx:
+                chat([], [], 1)
+        self.assertIn("without choices", str(ctx.exception))
 
 
 class CliMainTest(unittest.TestCase):
