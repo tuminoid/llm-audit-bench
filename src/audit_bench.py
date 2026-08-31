@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 PROTOCOL = "audit-v1"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 COMMON_PREFILL_TARGETS = (32768, 65536, 131072)
 DEFAULT_STREAMS = (1, 2, 4, 8)
 DEFAULT_DEEP_STREAMS = (1, 2, 4)

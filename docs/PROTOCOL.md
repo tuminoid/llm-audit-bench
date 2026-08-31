@@ -1,4 +1,4 @@
-# AuditBench v1
+npx -y cc-safety-net@latest update# AuditBench v1
 
 AuditBench v1 is the canonical serving benchmark for models used by the
 non-interactive security-audit workload. It replaces runtime-specific prompt
@@ -119,7 +119,7 @@ reasoning-default models such as Qwen3 need it to emit a non-empty answer
 at all. The workload text and the canonical settings table are unchanged,
 and the control does not affect `canonical`, so existing results remain
 comparable; the only output change is a new `settings.reasoning_effort`
-key, hence `SCHEMA_VERSION` 3.
+key, hence `SCHEMA_VERSION` 4.
 
 Before measuring, each adapter verifies the live model identity, configured
 context, and active slot count where the runtime exposes them. A forgotten

@@ -668,7 +668,7 @@ class AuditBenchTest(unittest.TestCase):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
         self.assertEqual(result, 0)
         report = json.loads(text.splitlines()[-1])
-        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["schema_version"], 4)
         self.assertEqual(report["protocol"], "audit-v1")
         self.assertFalse(report["publishable"])
         self.assertIn("capacity_near", report)
