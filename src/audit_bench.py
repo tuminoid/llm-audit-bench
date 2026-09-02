@@ -869,7 +869,7 @@ def openai_chat_fn(
         # every resent turn.
         if system_prompt is not None:
             messages = [{"role": "system", "content": system_prompt}] + messages
-        body: dict = {
+        payload: dict = {
             "model": model,
             "messages": messages,
             "tools": tools,
@@ -877,13 +877,36 @@ def openai_chat_fn(
             "max_tokens": max_tokens,
         }
         if reasoning_effort is not None:
-            body["reasoning_effort"] = reasoning_effort
-        payload = json.dumps(body).encode()
+            payload["reasoning_effort"] = reasoning_effort
         request = urllib.request.Request(
-            endpoint, payload, {"Content-Type": "application/json"}
+            endpoint,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}
         )
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read())
+        try:
+            with urllib.request.urlopen(
+                request, timeout=timeout
+            ) as response:
+                body = json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            message = exc.read().decode(errors="replace")
+            raise RuntimeError(f"{exc.code} from {endpoint}: {message}") from exc
+        if "choices" not in body:
+            error = body.get("error")
+            detail = (
+                str(error)[:200]
+                if error is not None
+                else f"keys={sorted(body.keys())}"
+            )
+            # Seen on LM Studio: a thinking model can spend the entire
+            # budget on reasoning_content, leaving no visible content; the
+            # server then answers 200 with no choices at all.
+            raise RuntimeError(
+                f"{endpoint} returned a body without choices: {detail} "
+                "(a thinking model can consume the whole budget on "
+                "reasoning; disable thinking or raise the output cap)"
+            )
+        return body
 
     return chat
 
