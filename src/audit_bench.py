@@ -869,7 +869,7 @@ def openai_chat_fn(
         # every resent turn.
         if system_prompt is not None:
             messages = [{"role": "system", "content": system_prompt}] + messages
-        body: dict = {
+        payload: dict = {
             "model": model,
             "messages": messages,
             "tools": tools,
@@ -877,10 +877,11 @@ def openai_chat_fn(
             "max_tokens": max_tokens,
         }
         if reasoning_effort is not None:
-            body["reasoning_effort"] = reasoning_effort
-        payload = json.dumps(body).encode()
+            payload["reasoning_effort"] = reasoning_effort
         request = urllib.request.Request(
-            endpoint, payload, {"Content-Type": "application/json"}
+            endpoint,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}
         )
         try:
             with urllib.request.urlopen(
