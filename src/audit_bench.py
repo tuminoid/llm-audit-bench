@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 PROTOCOL = "audit-v1"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 COMMON_PREFILL_TARGETS = (32768, 65536, 131072)
 DEFAULT_STREAMS = (1, 2, 4, 8)
 DEFAULT_DEEP_STREAMS = (1, 2, 4)
@@ -1742,6 +1742,427 @@ def _measure_family(
     }
 
 
+def _slug(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "unknown"
+
+
+def _output_dir() -> pathlib.Path:
+    """Retention directory for JSON documents.
+
+    The default is the directory audit-v1 results have always been kept
+    in, so a fresh --list finds the existing history.
+    """
+    state_root = pathlib.Path(
+        os.environ.get(
+            "XDG_STATE_HOME", pathlib.Path.home() / ".local" / "state"
+        )
+    )
+    return pathlib.Path(
+        os.environ.get("AUDIT_BENCH_OUTPUT_DIR", state_root / "auditbench")
+    )
+
+
+def _artifact_path(result: dict) -> pathlib.Path:
+    """Retention path for one run's JSON document."""
+    output_dir = _output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata = result["metadata"]
+    stamp = metadata["started_at_utc"].replace(":", "").replace("-", "")
+    return output_dir / (
+        f"{stamp}_{_slug(metadata['runtime'])}_{_slug(metadata['tag'])}"
+        f"_{_slug(result['settings']['profile'])}.json"
+    )
+
+
+def _median_of(section: dict | None, key: str) -> float:
+    """Median of a retained median/min/max triple; 0 when absent."""
+    return float(((section or {}).get(key) or {}).get("median") or 0)
+
+
+def _yes_no(value: bool) -> str:
+    return "yes" if value else "no"
+
+
+def _stream_list(streams: list[int]) -> str:
+    return ", ".join(str(count) for count in streams)
+
+
+def _cached(fraction: float | None) -> str:
+    return "not reported" if fraction is None else f"{fraction:.3f}"
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    """Right-aligned fixed-width table, indented under its section."""
+    widths = [
+        max(len(str(cell)) for cell in column)
+        for column in zip(headers, *rows)
+    ]
+    return [
+        "  " + "  ".join(
+            str(cell).rjust(width) for cell, width in zip(row, widths)
+        )
+        for row in [headers, *rows]
+    ]
+
+
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}{'' if count == 1 else 's'}"
+
+
+def _plan_lines(plan: dict) -> list[str]:
+    """Describe the planned workload; the whole point of a dry run."""
+    near = plan["capacity_near"]
+    lines = [
+        "  prefill prompts: "
+        + ", ".join(f"{target:,}" for target in plan["prefill_targets"]),
+        f"  near-context capacity: {near['target_prompt_tokens']:,}-token "
+        f"prompt at streams {_stream_list(near['streams'])}",
+        f"  decode ceiling: {plan['decode']['output_tokens']:,} output "
+        f"tokens at streams {_stream_list(plan['decode']['streams'])}",
+    ]
+    for phase in plan["audit_phases"]:
+        lines.append(
+            f"  {phase['name']}: {phase['target_prompt_tokens']:,}-token "
+            f"prompt, {phase['output_tokens']:,} output tokens, streams "
+            f"{_stream_list(phase['streams'])}"
+        )
+    lines.append(
+        f"  conversation and replay: {plan['conversation']['steps']} steps "
+        f"of {plan['conversation']['evidence_tokens']:,}-token evidence, "
+        f"concurrent replay streams "
+        f"{_stream_list(plan['replay_concurrent']['streams'])}"
+    )
+    return lines
+
+
+def _summary_lines(result: dict) -> list[str]:
+    """Render one result document as the default human report."""
+    metadata = result["metadata"]
+    settings = result["settings"]
+    plan = result["plan"]
+    lines = [
+        "",
+        f"=== {result['protocol']} summary: "
+        f"{metadata['runtime']}/{metadata['tag']} ===",
+        f"model={metadata['model']} "
+        f"context={plan['configured_context']:,} "
+        f"profile={settings['profile']} "
+        f"slots={metadata['active_slots']} "
+        f"kv-pool={metadata['kv_pool_tokens']:,}",
+    ]
+    if settings["dry_run"]:
+        lines += ["", "plan only; no server was contacted"]
+        lines += _plan_lines(plan)
+    if result.get("prefill"):
+        lines += ["", "prefill curve (1 stream, 1 output token)"]
+        lines += _table(
+            ["prompt", "wall s", "input tok/s"],
+            [
+                [
+                    f"{int(target):,}",
+                    f"{_median_of(section, 'wall_seconds'):.2f}",
+                    f"{_median_of(section, 'aggregate_prompt_tokens_per_second'):,.0f}",
+                ]
+                for target, section in result["prefill"].items()
+            ],
+        )
+    near = result.get("capacity_near")
+    if near:
+        target = plan["capacity_near"]["target_prompt_tokens"]
+        lines += [
+            "",
+            f"near-context capacity ({target:,}-token prompt, "
+            "1 output token)",
+        ]
+        lines += _table(
+            ["streams", "wall s", "input tok/s", "calls/h"],
+            [
+                [
+                    count,
+                    f"{_median_of(section, 'wall_seconds'):.2f}",
+                    f"{_median_of(section, 'aggregate_prompt_tokens_per_second'):,.0f}",
+                    f"{_median_of(section, 'calls_per_hour'):.1f}",
+                ]
+                for count, section in near["by_streams"].items()
+            ],
+        )
+    decode = result.get("decode")
+    if decode:
+        lines += [
+            "",
+            f"decode ceiling ({settings['output_tokens']:,} output tokens, "
+            "short prompt)",
+        ]
+        lines += _table(
+            ["streams", "output tok/s", "vs 1x"],
+            [
+                [
+                    count,
+                    f"{_median_of(section, 'end_to_end_output_tokens_per_second'):.2f}",
+                    f"{decode['scaling_vs_1x'][count]:.2f}",
+                ]
+                for count, section in decode["by_streams"].items()
+            ],
+        )
+        lines.append(
+            f"  peak at {_plural(decode['peak_streams'], 'stream')}: "
+            f"{decode['peak_end_to_end_output_tokens_per_second']:.2f} tok/s"
+        )
+    audits = result.get("audits")
+    if audits:
+        lines += ["", "end-to-end audit calls"]
+        lines += _table(
+            ["phase", "prompt", "out", "streams", "wall s", "calls/h",
+             "tok/s"],
+            [
+                [
+                    name,
+                    f"{phase['target_prompt_tokens']:,}",
+                    f"{phase['output_tokens']:,}",
+                    count,
+                    f"{_median_of(section, 'wall_seconds'):.1f}",
+                    f"{_median_of(section, 'calls_per_hour'):.1f}",
+                    f"{_median_of(section, 'end_to_end_output_tokens_per_second'):.2f}",
+                ]
+                for name, phase in audits.items()
+                for count, section in phase["by_streams"].items()
+            ],
+        )
+        lines.append(
+            "  calls/h is the production metric; tok/s is delivered output "
+            "over total wall, prefill included"
+        )
+    conversation = result.get("audit_conversation")
+    if conversation:
+        samples = conversation["samples"]
+        compliant = sum(1 for row in samples if row["compliant"])
+        recalled = [
+            row["findings_recalled"]
+            for row in samples
+            if row["findings_recalled"] is not None
+        ]
+        lines += [
+            "",
+            f"audit conversation ({_plural(conversation['steps'], 'step')}, "
+            f"{_plural(len(samples), 'sample')})",
+            f"  protocol compliant: {_yes_no(conversation['compliant'])} "
+            f"({compliant} of {len(samples)} samples)",
+            "  findings recalled: " + (
+                f"{statistics.median(recalled):.0f} of "
+                f"{conversation['steps']}"
+                if recalled
+                else "none"
+            ),
+            f"  wall {_median_of(conversation, 'wall_seconds'):.1f} s, "
+            f"{_median_of(conversation, 'conversations_per_hour'):.1f} "
+            "conversations/hour",
+            "  prompt tokens from cache: "
+            + _cached(conversation["cached_fraction_median"]),
+        ]
+    replay = result.get("audit_replay")
+    if replay:
+        samples = replay["samples"]
+        verdict = statistics.median(
+            [row["verdict_completion_tokens"] for row in samples]
+        )
+        lines += [
+            "",
+            f"audit replay ({_plural(replay['steps'], 'step')}, "
+            f"{_plural(len(samples), 'sample')})",
+            f"  wall {_median_of(replay, 'wall_seconds'):.1f} s, "
+            f"{_median_of(replay, 'replays_per_hour'):.1f} replays/hour",
+            f"  first turn "
+            f"{_median_of(replay, 'first_turn_wall_seconds'):.1f} s, "
+            f"final turn "
+            f"{_median_of(replay, 'final_turn_wall_seconds'):.1f} s",
+            f"  verdict {verdict:,.0f} tokens at "
+            f"{_median_of(replay, 'verdict_output_tokens_per_second'):.2f} "
+            "tok/s",
+            "  prompt tokens from cache: "
+            + _cached(replay["cached_fraction_median"]),
+        ]
+    concurrent = result.get("audit_replay_concurrent")
+    if concurrent:
+        lines += [
+            "",
+            "concurrent audit replay "
+            f"({_plural(concurrent['steps'], 'step')})",
+        ]
+        lines += _table(
+            ["streams", "wall s", "replays/h", "verdict tok/s", "cached",
+             "vs 1x"],
+            [
+                [
+                    count,
+                    f"{_median_of(section, 'wall_seconds'):.1f}",
+                    f"{_median_of(section, 'replays_per_hour'):.1f}",
+                    f"{_median_of(section, 'verdict_output_tokens_per_second'):.2f}",
+                    _cached(section["cached_fraction_median"]),
+                    f"{concurrent['scaling_vs_1x'][count]:.2f}",
+                ]
+                for count, section in concurrent["by_streams"].items()
+            ],
+        )
+        lines.append(
+            f"  peak at {_plural(concurrent['peak_streams'], 'stream')}: "
+            f"{concurrent['peak_replays_per_hour']:.1f} replays/hour"
+        )
+    reasons = result["publication_reasons"]
+    lines += [
+        "",
+        f"canonical={_yes_no(result['canonical'])} "
+        f"publishable={_yes_no(result['publishable'])}"
+        + (f" ({', '.join(reasons)})" if reasons else ""),
+    ]
+    if result.get("artifact_path"):
+        lines.append(f"json: {result['artifact_path']}")
+    return lines
+
+
+def _document_row(
+    path: pathlib.Path, directory: pathlib.Path
+) -> list[str] | None:
+    """One listing row, or None when the file is not an audit-v1 document."""
+    name = str(path.relative_to(directory))
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # A truncated result is named, not hidden: it may be a lost run.
+        return ["-", "-", "-", "unreadable", name]
+    if not isinstance(document, dict) or document.get("protocol") != PROTOCOL:
+        return None
+    metadata = document.get("metadata") or {}
+    if "publishable" not in document or "publication_reasons" not in document:
+        # Exactly what --show refuses to render, named the same way.
+        verdict = "legacy"
+    elif document["publishable"]:
+        verdict = "publishable"
+    else:
+        verdict = "canonical" if document.get("canonical") else "noncanonical"
+    return [
+        str(metadata.get("started_at_utc") or "-")[:19],
+        f"{metadata.get('runtime') or '-'}/{metadata.get('tag') or '-'}",
+        str((document.get("settings") or {}).get("profile") or "-"),
+        verdict,
+        name,
+    ]
+
+
+def _list_documents() -> int:
+    """List retained documents, newest first; a human index, not a schema.
+
+    Campaign evidence is filed in subdirectories of the retention
+    directory, so the index covers those too. Unrelated JSON in the tree
+    is counted, never dressed up as a result.
+    """
+    directory = _output_dir()
+    paths = sorted(
+        directory.rglob("*.json") if directory.is_dir() else [],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    rows = []
+    foreign = 0
+    for path in paths:
+        row = _document_row(path, directory)
+        if row is None:
+            foreign += 1
+        else:
+            rows.append(row)
+    if not rows:
+        print(f"no retained documents in {directory}")
+    else:
+        print(f"{_plural(len(rows), 'retained document')} in {directory}")
+        rows = [
+            ["when", "runtime/tag", "profile", "verdict", "file"],
+            *rows,
+        ]
+        widths = [max(len(row[index]) for row in rows) for index in range(5)]
+        for row in rows:
+            print(
+                "  "
+                + "  ".join(
+                    cell.ljust(width) for cell, width in zip(row, widths)
+                ).rstrip()
+            )
+    if foreign:
+        print(f"{_plural(foreign, 'other JSON file')} in the tree, ignored")
+    if rows:
+        print("re-print one with: audit-bench --show FILE")
+    return 0
+
+
+def _print_document(document: dict, output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(document, sort_keys=True))
+        return
+    for line in _summary_lines(document):
+        print(line)
+
+
+def _show(path: pathlib.Path, output_format: str) -> int:
+    """Re-print a retained document; no server contact, no new retention.
+
+    The argument is a file name as printed by --list, resolved in the
+    retention directory, or any path that exists as given.
+    """
+    directory = _output_dir()
+    if not path.exists() and (directory / path).exists():
+        path = directory / path
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(
+            f"cannot read {path}: no such file here or in {directory}"
+        ) from None
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot read {path}: {exc}") from exc
+    if document.get("protocol") != PROTOCOL:
+        raise SystemExit(
+            f"{path} is not a {PROTOCOL} document: "
+            f"protocol={document.get('protocol')!r}"
+        )
+    # An older document is read out, never guessed at: inferring a missing
+    # publishable verdict would misreport provenance.
+    missing = [
+        key
+        for key in (
+            "canonical",
+            "publishable",
+            "publication_reasons",
+            "settings",
+            "metadata",
+            "plan",
+        )
+        if key not in document
+    ]
+    if missing:
+        raise SystemExit(
+            f"{path} predates the summary: {', '.join(missing)} absent "
+            f"(schema_version={document.get('schema_version')}); "
+            "read the JSON directly"
+        )
+    document.setdefault("artifact_path", str(path))
+    _print_document(document, output_format)
+    return 0
+
+
+def _emit(result: dict, output_format: str) -> None:
+    """Retain the JSON document, then print the requested stdout form."""
+    path = _artifact_path(result)
+    result["artifact_path"] = str(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temporary.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    _print_document(result, output_format)
+
+
 def run_benchmark(
     *,
     runtime: str,
@@ -1754,8 +2175,16 @@ def run_benchmark(
     runtime_metadata: dict | None = None,
     provenance_files: dict[str, pathlib.Path] | None = None,
     openai_chat: Callable | None = None,
+    output_format: str = "human",
 ) -> int:
-    """Run AuditBench v1 and print a human report followed by JSON."""
+    """Run AuditBench v1, retain the JSON, and print progress plus result.
+
+    The result goes to stdout as the human summary, or as the one-line JSON
+    document with output_format="json"; the JSON is retained on disk either
+    way and its path is reported.
+    """
+    if output_format not in ("human", "json"):
+        raise ValueError("output_format must be human or json")
     settings = Settings.from_env()
     plan = build_plan(context, settings, active_slots, kv_pool_tokens)
     repository = _repository_state()
@@ -1791,12 +2220,7 @@ def run_benchmark(
     if settings.gate_cmd:
         print(f"gate: {settings.gate_cmd}")
     if settings.dry_run:
-        print(
-            json.dumps(
-                _result_envelope(settings, metadata, plan),
-                sort_keys=True,
-            )
-        )
+        _emit(_result_envelope(settings, metadata, plan), output_format)
         return 0
     if request is None:
         raise ValueError("request adapter is required unless AUDIT_BENCH_DRY_RUN=1")
@@ -1822,14 +2246,12 @@ def run_benchmark(
             context=context,
             variant_base=200000,
         )
-        print(
-            json.dumps(
-                {
-                    **_result_envelope(settings, metadata, plan),
-                    "decode": decode,
-                },
-                sort_keys=True,
-            )
+        _emit(
+            {
+                **_result_envelope(settings, metadata, plan),
+                "decode": decode,
+            },
+            output_format,
         )
         return 0
 
@@ -1874,15 +2296,13 @@ def run_benchmark(
                 openai_chat, calibration, context, settings,
                 tuple(plan["replay_concurrent"]["streams"]),
             )
-        print(
-            json.dumps(
-                {
-                    **_result_envelope(settings, metadata, plan),
-                    "calibration": asdict(calibration),
-                    key: section,
-                },
-                sort_keys=True,
-            )
+        _emit(
+            {
+                **_result_envelope(settings, metadata, plan),
+                "calibration": asdict(calibration),
+                key: section,
+            },
+            output_format,
         )
         return 0
 
@@ -1960,7 +2380,7 @@ def run_benchmark(
         "decode": decode,
         "audits": audits,
     }
-    print(json.dumps(result, sort_keys=True))
+    _emit(result, output_format)
     return 0
 
 
@@ -2045,7 +2465,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--base-url",
-        required=True,
         help="server base URL, e.g. http://127.0.0.1:8000",
     )
     parser.add_argument(
@@ -2058,7 +2477,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--context",
         type=int,
-        required=True,
         help="configured per-request context in tokens",
     )
     parser.add_argument(
@@ -2085,12 +2503,48 @@ def main(argv: list[str] | None = None) -> int:
         help="per-request timeout in seconds (default 7200)",
     )
     parser.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help=(
+            "stdout result format (default human); the JSON document is "
+            "retained on disk either way"
+        ),
+    )
+    documents = parser.add_mutually_exclusive_group()
+    documents.add_argument(
+        "--show",
+        type=pathlib.Path,
+        metavar="FILE",
+        help=(
+            "re-print a retained JSON document and exit; takes a file name "
+            "as listed by --list, or any path; contacts no server and "
+            "retains nothing"
+        ),
+    )
+    documents.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_documents",
+        help="list the retained JSON documents and exit",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="print the workload plan without contacting the server",
     )
     args = parser.parse_args(argv)
 
+    if args.list_documents:
+        return _list_documents()
+    if args.show:
+        return _show(args.show, args.format)
+    for name in ("base_url", "context"):
+        if getattr(args, name) is None:
+            parser.error(
+                f"--{name.replace('_', '-')} is required "
+                "unless --show names a document"
+            )
     if args.profile:
         os.environ["AUDIT_BENCH_PROFILE"] = args.profile
     if args.dry_run:
@@ -2179,6 +2633,7 @@ def main(argv: list[str] | None = None) -> int:
                 system_prompt=system_prompt,
             )
         ),
+        output_format=args.format,
     )
 
 

@@ -149,6 +149,44 @@ runner selection, and runtime-specific acceleration state. Missing live
 profile evidence is an error for a real managed run; dry runs record unchecked
 plans and are never publishable.
 
+## Output and retention
+
+Every run retains its complete JSON document on disk before printing
+anything, under `${XDG_STATE_HOME:-~/.local/state}/auditbench/` or the
+directory named by `AUDIT_BENCH_OUTPUT_DIR`, as
+`<started_at>_<runtime>_<tag>_<profile>.json`. The retained path is also
+the document's own `artifact_path`, so a result identifies its file.
+Retention is unconditional: dry runs and noncanonical runs are retained
+too, marked by their own `canonical` and `publication_reasons` fields.
+
+Stdout carries the live progress lines -- one per sample batch, plus every
+sampling extension -- and then the result in one of two forms:
+
+| Form | Selected by | Contents |
+| -- | -- | -- |
+| Human summary | default | Median rates per phase, the plan for a dry run, the canonicality and publication verdict, and the retained JSON path |
+| JSON document | `--format json`, or `output_format="json"` for adapters | The same document that was retained, on one line, as the last line of stdout |
+
+The summary reports medians only. Minima, maxima, every individual sample,
+per-turn conversation rows, and all provenance stay in the JSON: a summary
+is a reading aid and never the retained result. Schema version 5 added
+`artifact_path` and the human default; earlier documents remain comparable
+because no workload or setting changed.
+
+`audit-bench --show FILE` re-prints a retained document in either format,
+contacting no server and retaining nothing. `FILE` is the name printed by
+`--list`, resolved in the retention directory, or any path that exists as
+given. It refuses a document that predates the `publishable` verdict
+rather than inferring one, and exits 0 whenever it printed.
+
+`audit-bench --list` prints the retention directory
+and indexes what is in it -- time, runtime and tag, profile, verdict, and
+file name, newest first -- so the retained documents are discoverable
+without knowing the path convention. The index covers campaign
+subdirectories, names a file it cannot parse instead of hiding it, and
+counts unrelated JSON in the tree rather than presenting it as a result.
+The index is a human aid; tools read the directory themselves.
+
 ## Phases
 
 Let `C` be the configured per-request context.
@@ -448,7 +486,8 @@ uv run audit-bench --profile conversation \
 model. Without `--active-slots` and `--kv-tokens` the harness assumes one
 slot and one configured context of KV, so concurrency phases run 1x only.
 Every `AUDIT_BENCH_*` variable in this document applies to the CLI
-unchanged.
+unchanged. Add `--format json` when a tool consumes stdout; the JSON is
+retained on disk either way.
 
 Managed runtimes run through their own adapters and make targets in the
 serving-configuration repositories, which add capacity discovery from live

@@ -45,9 +45,22 @@ parser does not mean thinking is enabled by default.
 
 ## How results are generated
 
-This table is a projection of retained `capability-v1` JSON, not a hand-scored
-judgment. Copy each cell from the named check in the raw artifact
-into the results document:
+Every run retains its complete JSON report on disk before printing
+anything, then prints one of two forms on stdout: the human verdict by
+default -- every check with its status, seconds, and failure or skip
+reason, the identity evidence, the overall result, and the retained path
+-- or the one-line JSON report with `--format json`, for tools that parse
+it. The verdict is a projection; the report on disk is the result.
+`capability-check --show FILE` re-prints any retained report without
+contacting a server, taking the file name printed by `--list` or any path,
+and exits 0 whenever it printed: the gate verdict is the report's own
+`status`, not that exit code. `capability-check --list` indexes the
+retention directory, newest first, so a campaign can find the artifact a
+results row must cite.
+
+The results table is a projection of retained `capability-v1` JSON, not a
+hand-scored judgment. Copy each cell from the named check in the raw
+artifact into the results document:
 
 | Table column | JSON source |
 | -- | -- |
@@ -62,8 +75,10 @@ into the results document:
 | Artifact | basename of top-level `artifact_path` |
 
 Do not derive a pass from terminal prose, old benchmark notes, parser
-configuration, or manifest capability labels. Do not copy request timings
-into the results document; Capability Check is not a performance benchmark.
+configuration, or manifest capability labels. The printed verdict is a
+reading aid, not a source: transcribe from the retained JSON. Do not copy
+request timings into the results document; Capability Check is not a
+performance benchmark.
 
 ## Repeatable campaign procedure
 
@@ -91,6 +106,9 @@ an already running endpoint:
 uv run capability-check --base-url http://127.0.0.1:8000 \
   --model <served-name> --reasoning required --tools required
 ```
+
+Add `--format json` when a tool consumes stdout; the report is retained on
+disk either way.
 
 Remote raw JSON remains in that host's capability state directory. Copy or
 archive it with the campaign evidence before editing the results document.

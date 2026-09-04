@@ -484,15 +484,20 @@ def _skip(checks: dict, name: str, reason: str) -> None:
     checks[name] = {"status": "skipped", "reason": reason}
 
 
-def _artifact_path(report: dict) -> pathlib.Path:
+def _output_dir() -> pathlib.Path:
+    """Retention directory for JSON reports."""
     state_root = pathlib.Path(
         os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local" / "state")
     )
-    output_dir = pathlib.Path(
+    return pathlib.Path(
         os.environ.get(
             "CAPABILITY_OUTPUT_DIR", state_root / "capability-check"
         )
     )
+
+
+def _artifact_path(report: dict) -> pathlib.Path:
+    output_dir = _output_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = report["checked_at_utc"].replace(":", "").replace("-", "")
     safe_runtime = re.sub(r"[^a-z0-9]+", "-", report["runtime"].lower()).strip("-")
@@ -500,7 +505,170 @@ def _artifact_path(report: dict) -> pathlib.Path:
     return output_dir / f"{timestamp}_{safe_runtime}_{safe_tag}.json"
 
 
-def _emit(report: dict) -> None:
+def _list_reports() -> int:
+    """List retained reports, newest first; a human index, not a schema.
+
+    Campaign evidence is filed in subdirectories of the retention
+    directory, so the index covers those too. Unrelated JSON in the tree
+    is counted, never dressed up as a report.
+    """
+    directory = _output_dir()
+    paths = sorted(
+        directory.rglob("*.json") if directory.is_dir() else [],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    rows = [["when", "result", "runtime/tag", "file"]]
+    foreign = 0
+    for path in paths:
+        name = str(path.relative_to(directory))
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            rows.append(["-", "unreadable", "-", name])
+            continue
+        if not isinstance(report, dict) or report.get("protocol") != PROTOCOL:
+            foreign += 1
+            continue
+        rows.append([
+            str(report.get("checked_at_utc") or "-")[:19],
+            str(report.get("status") or "-"),
+            f"{report.get('runtime') or '-'}/{report.get('tag') or '-'}",
+            name,
+        ])
+    if len(rows) == 1:
+        print(f"no retained reports in {directory}")
+    else:
+        print(f"{len(rows) - 1} retained reports in {directory}")
+        widths = [max(len(row[index]) for row in rows) for index in range(4)]
+        for row in rows:
+            print(
+                "  "
+                + "  ".join(
+                    cell.ljust(width) for cell, width in zip(row, widths)
+                ).rstrip()
+            )
+    if foreign:
+        print(f"{foreign} other JSON files in the tree, ignored")
+    if len(rows) > 1:
+        print("re-print one with: capability-check --show FILE")
+    return 0
+
+
+def _identity_line(identity: dict) -> str:
+    """One line of the identity evidence the results table cites."""
+    if not identity.get("checked"):
+        return "identity: unchecked"
+    detail = next(
+        (
+            f"{key}={identity[key]}"
+            for key in ("digest", "revision", "parameter_size")
+            if identity.get(key)
+        ),
+        None,
+    )
+    return (
+        f"identity: {'verified' if identity.get('matched') else 'MISMATCH'}"
+        f" via {identity.get('source') or 'unknown source'}"
+        + (f", {detail}" if detail else "")
+    )
+
+
+def _summary_lines(report: dict) -> list[str]:
+    """Render the report as the default human verdict, not a score."""
+    expectations = report.get("expectations") or {}
+    checks = report.get("checks") or {}
+    lines = [
+        "",
+        f"=== {report['protocol']} verdict: "
+        f"{report['runtime']}/{report['tag']} ===",
+        f"model={report['model']}"
+        + (
+            f" expects reasoning={expectations['reasoning']} "
+            f"tools={expectations['tools']}"
+            if expectations
+            else ""
+        ),
+        "",
+    ]
+    width = max(len(name) for name in checks) if checks else 5
+    lines.append(f"  {'check'.ljust(width)}  status   seconds")
+    for name, check in checks.items():
+        seconds = check.get("seconds")
+        lines.append(
+            f"  {name.ljust(width)}  {check['status']:<8}"
+            + (f"{'-':>8}" if seconds is None else f"{seconds:8.2f}")
+        )
+    notes = [
+        f"  {name} {check['status']}: "
+        + str(check.get("error") or check.get("reason"))
+        for name, check in checks.items()
+        if check.get("error") or check.get("reason")
+    ]
+    if notes:
+        lines += ["", *notes]
+    lines += [
+        "",
+        _identity_line(report.get("identity") or {}),
+        f"result: {report['status'].upper()}"
+        + (
+            f" ({', '.join(report['failed_checks'])})"
+            if report.get("failed_checks")
+            else ""
+        ),
+    ]
+    if report.get("artifact_path"):
+        lines.append(f"json: {report['artifact_path']}")
+    return lines
+
+
+def _print_report(report: dict, output_format: str) -> None:
+    if output_format == "json":
+        print(json.dumps(report, sort_keys=True))
+        return
+    for line in _summary_lines(report):
+        print(line)
+
+
+def _show(path: pathlib.Path, output_format: str) -> int:
+    """Re-print a retained report; no server contact, no new retention.
+
+    The argument is a file name as printed by --list, resolved in the
+    retention directory, or any path that exists as given.
+    """
+    directory = _output_dir()
+    if not path.exists() and (directory / path).exists():
+        path = directory / path
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SystemExit(
+            f"cannot read {path}: no such file here or in {directory}"
+        ) from None
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"cannot read {path}: {exc}") from exc
+    if report.get("protocol") != PROTOCOL:
+        raise SystemExit(
+            f"{path} is not a {PROTOCOL} report: "
+            f"protocol={report.get('protocol')!r}"
+        )
+    missing = [
+        key
+        for key in ("status", "runtime", "tag", "model", "checks")
+        if key not in report
+    ]
+    if missing:
+        raise SystemExit(
+            f"{path} is not a readable {PROTOCOL} report: "
+            f"{', '.join(missing)} absent"
+        )
+    report.setdefault("artifact_path", str(path))
+    _print_report(report, output_format)
+    return 0
+
+
+def _emit(report: dict, output_format: str) -> None:
+    """Retain the JSON report, then print the requested stdout form."""
     report["host"] = platform.node()
     report["platform"] = platform.platform()
     path = _artifact_path(report)
@@ -514,7 +682,7 @@ def _emit(report: dict) -> None:
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
-    print(json.dumps(report, sort_keys=True))
+    _print_report(report, output_format)
 
 
 def run_capability_check(
@@ -526,8 +694,15 @@ def run_capability_check(
     config: CapabilityConfig,
     identity: dict,
     timeout_tokens: int = 2048,
+    output_format: str = "human",
 ) -> int:
-    """Run capability-v1, print one JSON report, and return its exit code."""
+    """Run capability-v1, retain the JSON report, and return its exit code.
+
+    Stdout carries the human verdict, or the one-line JSON report with
+    output_format="json"; the report is retained on disk either way.
+    """
+    if output_format not in ("human", "json"):
+        raise ValueError("output_format must be human or json")
     config.validate()
     checks = {}
 
@@ -710,7 +885,7 @@ def run_capability_check(
         "checks": checks,
         "failed_checks": failed,
     }
-    _emit(report)
+    _emit(report, output_format)
     return 1 if failed else 0
 
 
@@ -720,6 +895,7 @@ def setup_failure(
     tag: str,
     model: str | None,
     error: Exception,
+    output_format: str = "human",
 ) -> int:
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -737,7 +913,7 @@ def setup_failure(
         },
         "failed_checks": ["setup"],
     }
-    _emit(report)
+    _emit(report, output_format)
     return 1
 
 
@@ -785,10 +961,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--base-url",
-        required=True,
         help="server base URL, e.g. http://127.0.0.1:8000",
     )
-    parser.add_argument("--model", required=True, help="served model name")
+    parser.add_argument("--model", help="served model name")
     parser.add_argument(
         "--api",
         choices=("openai", "ollama"),
@@ -837,11 +1012,47 @@ def main(argv: list[str] | None = None) -> int:
         help="per-request timeout in seconds (default CAPABILITY_TIMEOUT or 600)",
     )
     parser.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help=(
+            "stdout report format (default human); the JSON report is "
+            "retained on disk either way"
+        ),
+    )
+    reports = parser.add_mutually_exclusive_group()
+    reports.add_argument(
+        "--show",
+        type=pathlib.Path,
+        metavar="FILE",
+        help=(
+            "re-print a retained JSON report and exit; takes a file name as "
+            "listed by --list, or any path; contacts no server and retains "
+            "nothing"
+        ),
+    )
+    reports.add_argument(
+        "--list",
+        action="store_true",
+        dest="list_reports",
+        help="list the retained JSON reports and exit",
+    )
+    parser.add_argument(
         "--tag",
         default=None,
         help="report tag (default: the model name)",
     )
     args = parser.parse_args(argv)
+    if args.list_reports:
+        return _list_reports()
+    if args.show:
+        return _show(args.show, args.format)
+    for name in ("base_url", "model"):
+        if getattr(args, name) is None:
+            parser.error(
+                f"--{name.replace('_', '-')} is required "
+                "unless --show names a report"
+            )
     tag = args.tag or args.model
     runtime = f"endpoint-{args.api}"
     try:
@@ -877,9 +1088,16 @@ def main(argv: list[str] | None = None) -> int:
             config=config,
             identity=identity,
             timeout_tokens=tokens,
+            output_format=args.format,
         )
     except Exception as exc:
-        return setup_failure(runtime=runtime, tag=tag, model=args.model, error=exc)
+        return setup_failure(
+            runtime=runtime,
+            tag=tag,
+            model=args.model,
+            error=exc,
+            output_format=args.format,
+        )
 
 
 if __name__ == "__main__":

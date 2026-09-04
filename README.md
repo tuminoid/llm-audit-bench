@@ -130,11 +130,34 @@ Three conclusions the headline number hides:
 
 ## Output
 
-Both commands print a human report followed by one JSON document.
-Capability Check also writes the JSON artifact under
-`${XDG_STATE_HOME:-~/.local/state}/capability-check/`. All `AUDIT_BENCH_*`
-protocol variables (profile, streams, samples, gate command, and the
-model-documented reasoning control) work unchanged; see
+`audit-bench` prints one progress line per sample batch while it runs, then
+a human-readable summary by default: the prefill curve, near-context
+capacity, decode ceiling, and audit-call tables of median rates, plus the
+`canonical` and `publishable` verdict. The complete JSON document is
+retained on disk regardless, under
+`${XDG_STATE_HOME:-~/.local/state}/auditbench/`, and the summary's last
+line names the file. `--format json` prints that same document on stdout
+instead, for tools that parse it.
+
+`capability-check` prints the same shape: a human verdict listing every
+check, its status, and any failure reason, with the retained JSON under
+`${XDG_STATE_HOME:-~/.local/state}/capability-check/` and `--format json`
+for tools.
+
+Either command lists what it has retained with `--list`, and re-prints one
+with `--show`, contacting no server. `--show` takes the file name straight
+from the listing, resolved in the retention directory, or any path:
+
+```bash
+uv run audit-bench --list
+uv run audit-bench --show 20260904T125150.571598+0000_endpoint_host_full.json
+uv run capability-check --list
+uv run capability-check --show ./archived/checked.json
+```
+
+All `AUDIT_BENCH_*` protocol variables (profile, streams, samples, gate
+command, and the model-documented reasoning control) work unchanged;
+`AUDIT_BENCH_OUTPUT_DIR` overrides the retention directory. See
 [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Reading the results

@@ -652,30 +652,125 @@ class AuditBenchTest(unittest.TestCase):
         "AUDIT_BENCH_DRY_RUN": "0",
     }
 
-    def _run_fake_protocol(self, extra_env: dict) -> tuple[int, str]:
+    def _run_fake_protocol(
+        self,
+        extra_env: dict,
+        output_format: str = "json",
+        openai_chat=None,
+    ) -> tuple[int, str]:
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {**self._FAKE_ENV, **extra_env}, clear=False):
-            with contextlib.redirect_stdout(output):
-                result = run_benchmark(
-                    runtime="fake",
-                    tag="fake-model",
-                    model="fake-model",
-                    context=131072,
-                    request=self._fake_request,
-                    active_slots=1,
-                    kv_pool_tokens=131072,
-                )
+        with tempfile.TemporaryDirectory() as directory:
+            env = {
+                **self._FAKE_ENV,
+                "AUDIT_BENCH_OUTPUT_DIR": directory,
+                **extra_env,
+            }
+            with mock.patch.dict(os.environ, env, clear=False):
+                with contextlib.redirect_stdout(output):
+                    result = run_benchmark(
+                        runtime="fake",
+                        tag="fake-model",
+                        model="fake-model",
+                        context=131072,
+                        request=self._fake_request,
+                        active_slots=1,
+                        kv_pool_tokens=131072,
+                        output_format=output_format,
+                        openai_chat=openai_chat,
+                    )
         return result, output.getvalue()
 
     def test_fake_adapter_runs_the_complete_protocol(self):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
         self.assertEqual(result, 0)
         report = json.loads(text.splitlines()[-1])
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 5)
         self.assertEqual(report["protocol"], "audit-v1")
         self.assertFalse(report["publishable"])
         self.assertIn("capacity_near", report)
         self.assertEqual(list(report["decode"]["by_streams"]), ["1"])
+
+    def test_json_document_is_retained_and_named_in_the_summary(self):
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            env = {**self._FAKE_ENV, "AUDIT_BENCH_OUTPUT_DIR": directory}
+            with mock.patch.dict(os.environ, env, clear=False):
+                with contextlib.redirect_stdout(output):
+                    run_benchmark(
+                        runtime="fake",
+                        tag="fake-model",
+                        model="fake-model",
+                        context=131072,
+                        request=self._fake_request,
+                        active_slots=1,
+                        kv_pool_tokens=131072,
+                    )
+            text = output.getvalue()
+            retained = list(pathlib.Path(directory).glob("*.json"))
+            self.assertEqual(len(retained), 1)
+            self.assertIn(f"json: {retained[0]}", text)
+            report = json.loads(retained[0].read_text(encoding="utf-8"))
+        self.assertEqual(report["schema_version"], 5)
+        self.assertEqual(report["artifact_path"], str(retained[0]))
+        self.assertIn("audits", report)
+
+    def test_human_summary_reports_every_measured_phase(self):
+        _, text = self._run_fake_protocol({}, output_format="human")
+        for expected in (
+            "=== audit-v1 summary: fake/fake-model ===",
+            "prefill curve (1 stream, 1 output token)",
+            "near-context capacity",
+            "decode ceiling",
+            "end-to-end audit calls",
+            "audit_32k",
+            "audit_deep",
+            "canonical=no publishable=no",
+        ):
+            self.assertIn(expected, text)
+        # The human report replaces the JSON on stdout, never wraps it.
+        self.assertNotIn('"schema_version"', text)
+
+    def test_replay_summary_reports_turns_verdict_and_cache(self):
+        _, text = self._run_fake_protocol(
+            {
+                "AUDIT_BENCH_PROFILE": "replay",
+                "AUDIT_BENCH_CONV_MAX_STEPS": "3",
+                "AUDIT_BENCH_SAMPLE_AGREEMENT": "0.5",
+            },
+            output_format="human",
+            openai_chat=self._fake_replay_chat(),
+        )
+        self.assertIn("audit replay (3 steps, 1 sample)", text)
+        self.assertIn("replays/hour", text)
+        self.assertIn("verdict", text)
+        self.assertIn("prompt tokens from cache: 0.", text)
+
+    def test_conversation_summary_reports_compliance_and_recall(self):
+        _, text = self._run_fake_protocol(
+            {
+                "AUDIT_BENCH_PROFILE": "conversation",
+                "AUDIT_BENCH_CONV_MAX_STEPS": "3",
+            },
+            output_format="human",
+            openai_chat=self._fake_conversation_chat(3),
+        )
+        self.assertIn("audit conversation (3 steps, 1 sample)", text)
+        self.assertIn("protocol compliant: yes (1 of 1 samples)", text)
+        self.assertIn("findings recalled: 0 of 3", text)
+        self.assertIn("conversations/hour", text)
+
+    def test_concurrent_replay_summary_tables_each_stream_count(self):
+        _, text = self._run_fake_protocol(
+            {
+                "AUDIT_BENCH_PROFILE": "replay-concurrent",
+                "AUDIT_BENCH_CONV_MAX_STEPS": "3",
+            },
+            output_format="human",
+            openai_chat=self._fake_concurrent_chat([]),
+        )
+        self.assertIn("concurrent audit replay (3 steps)", text)
+        self.assertIn("verdict tok/s", text)
+        self.assertIn("peak at 1 stream:", text)
 
     def test_file_provenance_hashes_exact_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -932,9 +1027,14 @@ class AuditBenchTest(unittest.TestCase):
 class CliMainTest(unittest.TestCase):
     def _run_main(self, argv: list[str]) -> tuple[int, str]:
         output = io.StringIO()
-        with mock.patch.dict(os.environ, {}, clear=False):
-            with contextlib.redirect_stdout(output):
-                code = main(argv)
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"AUDIT_BENCH_OUTPUT_DIR": directory},
+                clear=False,
+            ):
+                with contextlib.redirect_stdout(output):
+                    code = main(argv)
         return code, output.getvalue()
 
     def test_dry_run_uses_conservative_defaults(self):
@@ -947,6 +1047,8 @@ class CliMainTest(unittest.TestCase):
                 "--context",
                 "131072",
                 "--dry-run",
+                "--format",
+                "json",
             ]
         )
         self.assertEqual(code, 0)
@@ -980,6 +1082,8 @@ class CliMainTest(unittest.TestCase):
                 "--kv-tokens",
                 "524288",
                 "--dry-run",
+                "--format",
+                "json",
             ]
         )
         self.assertEqual(code, 0)
@@ -989,6 +1093,23 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(metadata["model"], "unspecified")
         self.assertEqual(metadata["active_slots"], 4)
         self.assertEqual(metadata["kv_pool_tokens"], 524288)
+
+    def test_dry_run_prints_the_plan_by_default(self):
+        code, text = self._run_main(
+            [
+                "--base-url",
+                "http://127.0.0.1:9",
+                "--context",
+                "131072",
+                "--dry-run",
+            ]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("plan only; no server was contacted", text)
+        self.assertIn("prefill prompts: 32,768, 65,536", text)
+        self.assertIn("audit_deep: 114,688-token prompt", text)
+        self.assertIn("canonical=yes publishable=no (dry_run", text)
+        self.assertNotIn('"schema_version"', text)
 
     def test_profile_flag_selects_workload(self):
         code, text = self._run_main(
@@ -1000,12 +1121,223 @@ class CliMainTest(unittest.TestCase):
                 "--profile",
                 "conversation",
                 "--dry-run",
+                "--format",
+                "json",
             ]
         )
         self.assertEqual(code, 0)
         report = json.loads(text.splitlines()[-1])
         self.assertEqual(report["settings"]["profile"], "conversation")
         self.assertTrue(report["canonical"])
+
+    def test_show_reprints_a_retained_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"AUDIT_BENCH_OUTPUT_DIR": directory},
+                clear=False,
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(
+                        [
+                            "--base-url",
+                            "http://127.0.0.1:9",
+                            "--context",
+                            "131072",
+                            "--dry-run",
+                        ]
+                    )
+                retained = list(pathlib.Path(directory).glob("*.json"))[0]
+                before = retained.read_bytes()
+                code, text = self._run_main(["--show", str(retained)])
+                # Re-printing retains nothing new and rewrites nothing.
+                self.assertEqual(
+                    list(pathlib.Path(directory).glob("*.json")), [retained]
+                )
+                self.assertEqual(retained.read_bytes(), before)
+                self.assertEqual(code, 0)
+                self.assertIn("plan only; no server was contacted", text)
+                self.assertIn(f"json: {retained}", text)
+                code, text = self._run_main(
+                    ["--show", str(retained), "--format", "json"]
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(text)["protocol"], "audit-v1")
+
+    def test_show_rejects_a_foreign_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "capability.json"
+            path.write_text('{"protocol": "capability-v1"}', encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "not a audit-v1"):
+                self._run_main(["--show", str(path)])
+            missing = pathlib.Path(directory) / "absent.json"
+            with self.assertRaisesRegex(SystemExit, "cannot read"):
+                self._run_main(["--show", str(missing)])
+
+    def test_show_refuses_to_guess_a_legacy_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "legacy.json"
+            # A pre-publication document: canonical without a publishable
+            # verdict, which the summary must never infer.
+            path.write_text(
+                json.dumps(
+                    {
+                        "protocol": "audit-v1",
+                        "canonical": True,
+                        "settings": {},
+                        "metadata": {},
+                        "plan": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SystemExit, "predates the summary: publishable"
+            ):
+                self._run_main(["--show", str(path)])
+
+    def test_running_still_requires_an_endpoint(self):
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit):
+                self._run_main(["--context", "131072"])
+        self.assertIn("--base-url is required", errors.getvalue())
+
+    def test_list_indexes_retained_documents_newest_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(
+                os.environ,
+                {"AUDIT_BENCH_OUTPUT_DIR": directory},
+                clear=False,
+            ):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["--base-url", "http://127.0.0.1:9",
+                          "--context", "131072", "--dry-run"])
+                    main(["--base-url", "http://127.0.0.1:9",
+                          "--context", "262144", "--profile", "replay",
+                          "--dry-run"])
+                broken = pathlib.Path(directory) / "broken.json"
+                broken.write_text("not json", encoding="utf-8")
+                # Campaign evidence is filed in subdirectories, and
+                # unrelated probe JSON shares the tree.
+                campaign = pathlib.Path(directory) / "campaign-1"
+                campaign.mkdir()
+                (campaign / "probe.json").write_text(
+                    '{"probe": 1}', encoding="utf-8"
+                )
+                archived = campaign / "archived.json"
+                archived.write_text(
+                    json.dumps(
+                        {
+                            "protocol": "audit-v1",
+                            "canonical": True,
+                            "publishable": True,
+                            "publication_reasons": [],
+                            "settings": {"profile": "full"},
+                            "metadata": {
+                                "runtime": "vllm",
+                                "tag": "host",
+                                "started_at_utc": "2026-08-31T08:24:59+00:00",
+                            },
+                            "plan": {},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = main(["--list"])
+        lines = output.getvalue().splitlines()
+        self.assertEqual(code, 0)
+        self.assertEqual(lines[0], f"4 retained documents in {directory}")
+        self.assertIn("when", lines[1])
+        # Newest first, with the unusable file named rather than hidden.
+        self.assertIn("campaign-1/archived.json", lines[2])
+        self.assertIn("publishable", lines[2])
+        self.assertIn("unreadable", lines[3])
+        self.assertIn("replay", lines[4])
+        self.assertIn("full", lines[5])
+        self.assertIn("1 other JSON file in the tree, ignored", lines[6])
+        self.assertEqual(lines[-1], "re-print one with: audit-bench --show FILE")
+
+    def test_list_says_so_when_nothing_is_retained(self):
+        with tempfile.TemporaryDirectory() as directory:
+            empty = pathlib.Path(directory) / "absent"
+            with mock.patch.dict(
+                os.environ,
+                {"AUDIT_BENCH_OUTPUT_DIR": str(empty)},
+                clear=False,
+            ):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = main(["--list"])
+            # Listing never creates the directory it reports on.
+            self.assertFalse(empty.exists())
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            output.getvalue().strip(), f"no retained documents in {empty}"
+        )
+
+    def test_show_takes_a_listed_file_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            campaign = pathlib.Path(directory) / "campaign-1"
+            campaign.mkdir()
+            document = {
+                "protocol": "audit-v1",
+                "canonical": True,
+                "publishable": True,
+                "publication_reasons": [],
+                "settings": {"profile": "full", "dry_run": False,
+                             "output_tokens": 1024},
+                "metadata": {"runtime": "vllm", "tag": "host",
+                             "model": "m", "active_slots": 8,
+                             "kv_pool_tokens": 742613},
+                "plan": {"configured_context": 262144},
+            }
+            for path in (
+                pathlib.Path(directory) / "top.json",
+                campaign / "archived.json",
+            ):
+                path.write_text(json.dumps(document), encoding="utf-8")
+            with mock.patch.dict(
+                os.environ,
+                {"AUDIT_BENCH_OUTPUT_DIR": directory},
+                clear=False,
+            ):
+                for argument in ("top.json", "campaign-1/archived.json"):
+                    output = io.StringIO()
+                    with contextlib.redirect_stdout(output):
+                        code = main(["--show", argument])
+                    self.assertEqual(code, 0)
+                    self.assertIn(
+                        "=== audit-v1 summary: vllm/host ===",
+                        output.getvalue(),
+                    )
+                    self.assertIn(
+                        f"json: {directory}/{argument}", output.getvalue()
+                    )
+                with self.assertRaisesRegex(
+                    SystemExit, f"no such file here or in {directory}"
+                ):
+                    main(["--show", "absent.json"])
+
+    def test_list_marks_documents_show_refuses_as_legacy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "legacy.json"
+            path.write_text(
+                json.dumps({"protocol": "audit-v1", "canonical": True}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {"AUDIT_BENCH_OUTPUT_DIR": directory},
+                clear=False,
+            ):
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = main(["--list"])
+        self.assertEqual(code, 0)
+        self.assertIn("legacy", output.getvalue())
+        self.assertNotIn("canonical", output.getvalue())
 
     def test_rejects_non_integer_capacity_env(self):
         with mock.patch.dict(
