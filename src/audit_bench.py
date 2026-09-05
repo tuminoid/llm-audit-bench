@@ -1757,8 +1757,11 @@ def _output_dir() -> pathlib.Path:
             "XDG_STATE_HOME", pathlib.Path.home() / ".local" / "state"
         )
     )
+    # Consumers forward the whole variable list, so an unset override
+    # arrives as an empty string; that means default, not "here".
     return pathlib.Path(
-        os.environ.get("AUDIT_BENCH_OUTPUT_DIR", state_root / "auditbench")
+        os.environ.get("AUDIT_BENCH_OUTPUT_DIR")
+        or state_root / "auditbench"
     )
 
 

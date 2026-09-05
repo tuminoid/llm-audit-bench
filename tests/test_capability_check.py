@@ -11,15 +11,51 @@ import capability_check
 from capability_check import (
     CapabilityConfig,
     ChatResult,
+    HTTPRejected,
     ToolCall,
     _ollama_identity,
     _openai_identity,
+    _output_dir,
     main,
     openai_control,
     ollama_control,
     resolve_shell_config,
     run_capability_check,
 )
+
+
+def conforming_document() -> str:
+    """A document that satisfies the fixture schema exactly."""
+    return json.dumps(
+        {
+            "repository": "acme/ledger",
+            "summary": {
+                "verdict": "findings",
+                "finding_count": capability_check.JSON_SCHEMA_FINDINGS,
+                "highest_severity": "critical",
+                "confident": True,
+            },
+            "findings": [
+                {
+                    "id": f"F-{index:03d}",
+                    "title": f"issue {index}",
+                    "severity": "high",
+                    "category": "injection",
+                    "location": {
+                        "file": f"module_{index}.py",
+                        "symbol": f"function_{index}",
+                        "start_line": index,
+                        "end_line": index + 4,
+                    },
+                    "evidence": ["line quoted", "call path"],
+                    "remediation": "parameterize the query",
+                    "exploitable": True,
+                }
+                for index in range(capability_check.JSON_SCHEMA_FINDINGS)
+            ],
+            "unreviewed": ["vendor/", "migrations/"],
+        }
+    )
 
 
 class FakeAdapter:
@@ -35,6 +71,22 @@ class FakeAdapter:
     ):
         del max_tokens, stream
         prompt = str(messages[-1].get("content", ""))
+        if options and "response_format" in options:
+            # A constrained server ignores the prose and obeys the schema.
+            return ChatResult(
+                content=conforming_document(),
+                chunks=1,
+                completed=True,
+                finish_reason="stop",
+            )
+        if "matching this schema" in prompt:
+            # The unaided ask: this fake model complies without a grammar.
+            return ChatResult(
+                content=conforming_document(),
+                chunks=1,
+                completed=True,
+                finish_reason="stop",
+            )
         if force_tool:
             return ChatResult(
                 tool_calls=[
@@ -95,6 +147,138 @@ class FakeAdapter:
             "tool_call_id": call.call_id,
             "content": content,
         }
+
+    @staticmethod
+    def schema_options(schema):
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "audit_verdict", "schema": schema,
+                                "strict": True},
+            }
+        }
+
+
+class UnenforcingAdapter(FakeAdapter):
+    """A server that accepts response_format and ignores it."""
+
+    def chat(self, messages, *, max_tokens, stream, tools=None,
+             options=None, force_tool=None):
+        if options and "response_format" in options:
+            return ChatResult(
+                content='## Audit\n\nOne finding.\n\n```json\n'
+                '{"verdict":"finding","count":1,"refs":["a.py","b.py"]}\n```',
+                chunks=1,
+                completed=True,
+                finish_reason="stop",
+            )
+        return super().chat(
+            messages, max_tokens=max_tokens, stream=stream, tools=tools,
+            options=options, force_tool=force_tool,
+        )
+
+
+class RejectingAdapter(FakeAdapter):
+    """A server without constrained decoding, refusing the parameter."""
+
+    def chat(self, messages, *, max_tokens, stream, tools=None,
+             options=None, force_tool=None):
+        if options and "response_format" in options:
+            raise HTTPRejected(
+                400, "http://x/v1/chat/completions",
+                '{"error":"response_format is not supported"}',
+            )
+        return super().chat(
+            messages, max_tokens=max_tokens, stream=stream, tools=tools,
+            options=options, force_tool=force_tool,
+        )
+
+
+class JsonOnlyAdapter(FakeAdapter):
+    """A server that enforces JSON-ness but not the schema."""
+
+    def chat(self, messages, *, max_tokens, stream, tools=None,
+             options=None, force_tool=None):
+        if options and "response_format" in options:
+            # Valid JSON, one finding short and an enum it invented: the
+            # shape a compiler produces when it drops keywords.
+            document = json.loads(conforming_document())
+            document["findings"] = document["findings"][:-1]
+            document["summary"]["highest_severity"] = "catastrophic"
+            return ChatResult(
+                content=json.dumps(document),
+                chunks=1,
+                completed=True,
+                finish_reason="stop",
+            )
+        return super().chat(
+            messages, max_tokens=max_tokens, stream=stream, tools=tools,
+            options=options, force_tool=force_tool,
+        )
+
+
+class TruncatingAdapter(FakeAdapter):
+    """A constrained response cut off at the token budget."""
+
+    def chat(self, messages, *, max_tokens, stream, tools=None,
+             options=None, force_tool=None):
+        if options and "response_format" in options:
+            return ChatResult(
+                content=conforming_document()[:200],
+                chunks=1,
+                completed=True,
+                finish_reason="length",
+            )
+        return super().chat(
+            messages, max_tokens=max_tokens, stream=stream, tools=tools,
+            options=options, force_tool=force_tool,
+        )
+
+
+class WhitespaceRunawayAdapter(FakeAdapter):
+    """A grammar-valid whitespace loop: legal tokens, no document."""
+
+    def chat(self, messages, *, max_tokens, stream, tools=None,
+             options=None, force_tool=None):
+        if options and "response_format" in options:
+            return ChatResult(
+                content='{\n  "repository":' + "\t" * 4000,
+                chunks=1,
+                completed=True,
+                finish_reason="length",
+            )
+        return super().chat(
+            messages, max_tokens=max_tokens, stream=stream, tools=tools,
+            options=options, force_tool=force_tool,
+        )
+
+
+class ProseAdapter(FakeAdapter):
+    """A model that answers the unaided ask with a report, not a document."""
+
+    def chat(self, messages, *, max_tokens, stream, tools=None,
+             options=None, force_tool=None):
+        prompt = str(messages[-1].get("content", ""))
+        if "matching this schema" in prompt and not (
+            options and "response_format" in options
+        ):
+            return ChatResult(
+                content="# Security Audit Report: acme/ledger\n\nThis report "
+                "details six findings across the reviewed modules.",
+                chunks=1,
+                completed=True,
+                finish_reason="stop",
+            )
+        return super().chat(
+            messages, max_tokens=max_tokens, stream=stream, tools=tools,
+            options=options, force_tool=force_tool,
+        )
+
+
+class SchemalessAdapter(FakeAdapter):
+    """An adapter that cannot express enforcement at all."""
+
+    schema_options = None
 
 
 class ToollessAdapter(FakeAdapter):
@@ -176,9 +360,11 @@ class CapabilityCheckTest(unittest.TestCase):
             "tool_call",
             "tool_round_trip",
             "structured_json",
+            "json_schema",
         ):
             self.assertIn(name, text)
         self.assertIn("identity: verified via /v1/models", text)
+        self.assertIn("schema enforcement: enforced", text)
         self.assertIn("result: PASSED", text)
         # The verdict replaces the JSON on stdout, never wraps it.
         self.assertNotIn('"schema_version"', text)
@@ -210,6 +396,235 @@ class CapabilityCheckTest(unittest.TestCase):
         self.assertIn("tool_round_trip skipped: tool_call failed", text)
         self.assertIn("identity: unchecked", text)
         self.assertIn("result: FAILED (model_identity, tool_call", text)
+
+    def test_enforcement_modes_are_recorded_and_only_lying_fails(self):
+        cases = {
+            FakeAdapter: ("passed", "enforced", 0),
+            RejectingAdapter: ("passed", "unsupported", 0),
+            UnenforcingAdapter: ("failed", "ignored", 1),
+            JsonOnlyAdapter: ("failed", "json_only", 1),
+            TruncatingAdapter: ("failed", "truncated", 1),
+            WhitespaceRunawayAdapter: ("failed", "whitespace_runaway", 1),
+        }
+        for adapter_class, (status, enforcement, code) in cases.items():
+            with self.subTest(adapter=adapter_class.__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    output = io.StringIO()
+                    with mock.patch.dict(
+                        os.environ,
+                        {"CAPABILITY_OUTPUT_DIR": directory},
+                        clear=False,
+                    ):
+                        with contextlib.redirect_stdout(output):
+                            result = run_capability_check(
+                                runtime="fake",
+                                tag="fixture",
+                                model="fixture",
+                                adapter=adapter_class(),
+                                config=CapabilityConfig(
+                                    reasoning="required",
+                                    tools="required",
+                                    disable_options={"disabled": True},
+                                ),
+                                identity={"checked": True, "matched": True},
+                                output_format="json",
+                            )
+                    report = json.loads(output.getvalue())
+                check = report["checks"]["json_schema"]
+                self.assertEqual(result, code)
+                self.assertEqual(check["status"], status)
+                # The mode is retained even when the check failed.
+                self.assertEqual(check["enforcement"], enforcement)
+                if enforcement == "unsupported":
+                    self.assertEqual(check["http_status"], 400)
+                    self.assertIn("not supported", check["rejection"])
+                if enforcement == "ignored":
+                    self.assertIn("returned non-JSON", check["error"])
+                if enforcement == "json_only":
+                    self.assertIn("violating the schema", check["error"])
+                if enforcement == "truncated":
+                    self.assertIn("token budget", check["error"])
+                if enforcement == "whitespace_runaway":
+                    self.assertIn("structural whitespace", check["error"])
+                    # The tab spew is retained, so the cause is visible.
+                    self.assertIn("\t", check["response"]["document"])
+
+    def test_enforcement_is_skipped_when_the_adapter_cannot_express_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with mock.patch.dict(
+                os.environ, {"CAPABILITY_OUTPUT_DIR": directory}, clear=False
+            ):
+                with contextlib.redirect_stdout(output):
+                    result = run_capability_check(
+                        runtime="fake",
+                        tag="fixture",
+                        model="fixture",
+                        adapter=SchemalessAdapter(),
+                        config=CapabilityConfig(
+                            reasoning="required", tools="required"
+                        ),
+                        identity={"checked": True, "matched": True},
+                        output_format="json",
+                    )
+            report = json.loads(output.getvalue())
+        check = report["checks"]["json_schema"]
+        self.assertEqual(result, 0)
+        self.assertEqual(check["status"], "skipped")
+        self.assertIn("cannot express schema enforcement", check["reason"])
+
+    def test_unaided_document_is_recorded_and_never_gates(self):
+        cases = {FakeAdapter: "valid", ProseAdapter: "ignored"}
+        for adapter_class, unaided in cases.items():
+            with self.subTest(adapter=adapter_class.__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    output = io.StringIO()
+                    with mock.patch.dict(
+                        os.environ,
+                        {"CAPABILITY_OUTPUT_DIR": directory},
+                        clear=False,
+                    ):
+                        with contextlib.redirect_stdout(output):
+                            code = run_capability_check(
+                                runtime="fake",
+                                tag="fixture",
+                                model="fixture",
+                                adapter=adapter_class(),
+                                config=CapabilityConfig(
+                                    reasoning="required",
+                                    tools="required",
+                                    disable_options={"disabled": True},
+                                ),
+                                identity={"checked": True, "matched": True},
+                                output_format="json",
+                            )
+                    report = json.loads(output.getvalue())
+                check = report["checks"]["structured_json"]
+                self.assertEqual(check["unaided"], unaided)
+                # A model that cannot do it unaided still passes the gate:
+                # the fact is deployment-conditional, not disqualifying.
+                self.assertEqual(check["status"], "passed")
+                self.assertEqual(report["status"], "passed")
+                self.assertEqual(code, 0)
+                self.assertIn(
+                    "document", check["unaided_response"]
+                )
+
+    def test_unaided_records_a_truncated_or_failed_attempt(self):
+        class TruncatedUnaided(FakeAdapter):
+            def chat(self, messages, *, max_tokens, stream, tools=None,
+                     options=None, force_tool=None):
+                prompt = str(messages[-1].get("content", ""))
+                if "matching this schema" in prompt:
+                    return ChatResult(
+                        content=conforming_document()[:300],
+                        chunks=1,
+                        completed=True,
+                        finish_reason="length",
+                    )
+                return super().chat(
+                    messages, max_tokens=max_tokens, stream=stream,
+                    tools=tools, options=options, force_tool=force_tool,
+                )
+
+        class BrokenUnaided(FakeAdapter):
+            def chat(self, messages, *, max_tokens, stream, tools=None,
+                     options=None, force_tool=None):
+                prompt = str(messages[-1].get("content", ""))
+                if "matching this schema" in prompt:
+                    raise HTTPRejected(500, "http://x", "upstream exploded")
+                return super().chat(
+                    messages, max_tokens=max_tokens, stream=stream,
+                    tools=tools, options=options, force_tool=force_tool,
+                )
+
+        for adapter_class, unaided in (
+            (TruncatedUnaided, "truncated"),
+            (BrokenUnaided, "error"),
+        ):
+            with self.subTest(adapter=adapter_class.__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    output = io.StringIO()
+                    with mock.patch.dict(
+                        os.environ,
+                        {"CAPABILITY_OUTPUT_DIR": directory},
+                        clear=False,
+                    ):
+                        with contextlib.redirect_stdout(output):
+                            code = run_capability_check(
+                                runtime="fake",
+                                tag="fixture",
+                                model="fixture",
+                                adapter=adapter_class(),
+                                config=CapabilityConfig(
+                                    reasoning="required", tools="required"
+                                ),
+                                identity={"checked": True, "matched": True},
+                                output_format="json",
+                            )
+                    report = json.loads(output.getvalue())
+                check = report["checks"]["structured_json"]
+                self.assertEqual(check["unaided"], unaided)
+                self.assertEqual(check["status"], "passed")
+                self.assertEqual(code, 0)
+
+    def test_json_schema_fixture_is_adversarial_and_self_validating(self):
+        # The fixture must be adversarial: an unconstrained model that
+        # obeys the prose cannot satisfy the schema, so a pass is evidence
+        # of constrained decoding rather than of good manners.
+        self.assertIn("Markdown", capability_check.JSON_SCHEMA_PROMPT)
+        self.assertIn("fenced code block", capability_check.JSON_SCHEMA_PROMPT)
+
+        # The validator supports one keyword subset and the fixture stays
+        # inside it, so validation cannot silently under-check the schema.
+        def keywords(node):
+            for key, value in node.items():
+                if key == "properties":
+                    for child in value.values():
+                        yield from keywords(child)
+                    continue
+                yield key
+                if key == "items":
+                    yield from keywords(value)
+
+        found = set(keywords(capability_check.JSON_SCHEMA))
+        self.assertTrue(
+            found <= capability_check.JSON_SCHEMA_KEYWORDS,
+            f"unsupported keywords in fixture: "
+            f"{found - capability_check.JSON_SCHEMA_KEYWORDS}",
+        )
+
+        # A thousand-token document is the point: a three-key object would
+        # exercise no nesting, item counts, or enums at depth.
+        self.assertGreater(len(conforming_document()), 1000)
+        self.assertTrue(
+            capability_check._validates_json_schema(
+                json.loads(conforming_document())
+            )
+        )
+
+        broken = [
+            ("dropped finding", lambda doc: doc["findings"].pop()),
+            ("extra key", lambda doc: doc.update(notes="hi")),
+            ("bad enum", lambda doc: doc["summary"].update(verdict="maybe")),
+            ("nested enum",
+             lambda doc: doc["findings"][0].update(severity="fatal")),
+            ("boolean where integer belongs",
+             lambda doc: doc["findings"][0]["location"].update(start_line=True)),
+            ("short evidence array",
+             lambda doc: doc["findings"][0].update(evidence=["only one"])),
+            ("extra nested key",
+             lambda doc: doc["findings"][0]["location"].update(commit="abc")),
+            ("missing nested key",
+             lambda doc: doc["findings"][0]["location"].pop("symbol")),
+        ]
+        for label, mutate in broken:
+            with self.subTest(case=label):
+                document = json.loads(conforming_document())
+                mutate(document)
+                self.assertFalse(
+                    capability_check._validates_json_schema(document)
+                )
 
     def test_control_modes_are_explicit(self):
         self.assertEqual(
@@ -378,6 +793,12 @@ class CliMainTest(unittest.TestCase):
                 main(["--model", "m"])
         self.assertIn("--base-url is required", errors.getvalue())
 
+
+    def test_empty_output_dir_override_means_default(self):
+        with mock.patch.dict(
+            os.environ, {"CAPABILITY_OUTPUT_DIR": ""}, clear=False
+        ):
+            self.assertEqual(_output_dir().name, "capability-check")
 
     def test_show_takes_a_listed_file_name(self):
         with tempfile.TemporaryDirectory() as directory:

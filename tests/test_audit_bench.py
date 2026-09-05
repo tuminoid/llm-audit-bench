@@ -23,6 +23,7 @@ from audit_bench import (
     _measure_family,
     _measure_replay_concurrent,
     _measure_replays,
+    _output_dir,
     _publication_status,
     audit_prompt,
     build_plan,
@@ -1276,6 +1277,14 @@ class CliMainTest(unittest.TestCase):
         self.assertEqual(
             output.getvalue().strip(), f"no retained documents in {empty}"
         )
+
+    def test_empty_output_dir_override_means_default(self):
+        # Consumers forward every AUDIT_BENCH_* name, so an unset override
+        # arrives as an empty string and must not retain in the cwd.
+        with mock.patch.dict(
+            os.environ, {"AUDIT_BENCH_OUTPUT_DIR": ""}, clear=False
+        ):
+            self.assertEqual(_output_dir().name, "auditbench")
 
     def test_show_takes_a_listed_file_name(self):
         with tempfile.TemporaryDirectory() as directory:

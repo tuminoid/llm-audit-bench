@@ -19,7 +19,8 @@ The protocol uses fixed local fixtures:
 | Thinking disabled | When configured, the documented control produces correct content with an empty reasoning field |
 | Tool call | Exactly one `lookup_issue` call carries `{"issue_number": 42}` |
 | Tool round trip | The model consumes the returned `sentinel-cobalt` value and finishes without another tool call |
-| Structured JSON | The final content is the exact requested JSON object, without Markdown cleanup |
+| Structured JSON | The final content is the exact requested JSON object, without Markdown cleanup. The same check records, without gating, what the model manages when asked for the full fixture document with the schema stated in words (`unaided`) |
+| JSON schema | The endpoint is honest about schema enforcement: it either constrains decoding to the fixture schema, or refuses the parameter with a 4xx. Accepting it and returning anything else fails |
 
 The reasoning fixture allows enough output for models whose thought phase is
 longer than their answer. Results retain content excerpts and field lengths,
@@ -28,6 +29,81 @@ not reasoning text.
 The OpenAI-compatible adapters use named `tool_choice`. Ollama's native
 `/api/chat` has no equivalent force parameter, so its fixed prompt requires
 the call and the same exact name and arguments are validated afterward.
+
+### Model manners versus server enforcement
+
+Two different facts share the word "structured", and the protocol keeps them
+apart:
+
+- **Structured JSON** is a model property. The request carries no format
+  parameter, so the check measures whether the model volunteers a bare
+  object when asked plainly. A fence, a preamble, or trailing prose fails.
+  The same check then asks for the full fixture document with the schema
+  stated in words, fairly rather than adversarially, and records the outcome
+  in `unaided` without gating on it: `valid`, `json_only`, `ignored`,
+  `truncated`, or `error`. That fact decides only whether a server which
+  cannot constrain decoding is usable with this model, so it is recorded and
+  never disqualifying -- a model needing the grammar is fine on a host that
+  provides one.
+- **JSON schema** is a server property. Constrained decoding masks invalid
+  tokens during sampling -- `response_format` carrying a `json_schema` on
+  OpenAI-compatible servers, the schema in `format` on Ollama -- so it holds
+  regardless of the model's manners, and it is a function of the server
+  build and its flags.
+
+Read the pair together. `enforced` with `unaided: ignored` means the host
+carries the model; `ignored` with `unaided: valid` means the server
+guarantees nothing but this model complies anyway; `ignored` with
+`unaided: ignored` is the combination that keeps a model off that host for
+structured work.
+
+The enforcement fixture is adversarial on purpose: a strict schema
+(`verdict` enum, integer `count`, at least two `refs`, no additional
+properties) paired with a prompt demanding Markdown prose, a heading, and a
+fenced block. An unconstrained model that obeys the prose cannot satisfy the
+schema, so a pass is evidence of the grammar rather than of good manners.
+
+Its `enforcement` field names what happened, and is retained on failure too:
+
+| Value | Meaning | Status |
+| -- | -- | -- |
+| `enforced` | Output validates against the fixture schema | passed |
+| `unsupported` | The endpoint refused the parameter with a 4xx | passed |
+| `json_only` | Parseable JSON that violates the accepted schema: JSON mode rather than schema mode, or a schema compiler that silently dropped keywords it cannot express | failed |
+| `ignored` | The parameter was accepted and the content is not JSON at all | failed |
+| `whitespace_runaway` | The server permits structural whitespace, and the model emitted it until the budget ran out: grammar-valid, no document | failed |
+| `truncated` | The response hit the token budget before closing the document, so nothing is proven | failed |
+
+A server without constrained decoding is not defective and passes by refusing
+the parameter; a server that accepts it and does not honor it fails, because
+callers would otherwise trust a guarantee that does not exist. The check runs
+in the same mode as Structured JSON: the documented disable control when the
+model has one, the reasoning control otherwise.
+
+Thinking and enforcement coexist, and the fixed 16,384-token budget exists
+for that reason. Servers constrain the visible content channel and leave the
+reasoning channel free, so a thinking model reasons unconstrained, then emits
+a schema-clean document; the budget has to cover both. A model whose thinking
+crowds out the document reports `truncated`, which is a fact about that model
+under a fixed workload rather than a knob to widen.
+
+A `truncated` result is worth reading before blaming the model, because a
+grammar bounds structure and not length. Where a server permits structural
+whitespace between JSON tokens, a model can emit an unbounded run of it and
+still be grammar-valid, consuming the whole budget without closing the
+document; that case is reported as `whitespace_runaway` rather than
+`truncated`, because the fix is the server's compact-output setting and not a
+larger budget. The retained document shows it at a glance. Plain `truncated`
+means the document was progressing and simply did not finish, which for a
+thinking model usually means its reasoning crowded out the document.
+
+Enforcement constrains shape, never content. A schema-valid document can
+still carry a wrong verdict, invented references, or fields that contradict
+each other, so `enforced` is not evidence of audit correctness and never
+substitutes for the conversation profile in AuditBench.
+
+Validation is direct rather than schema-driven: the fixture schema is fixed
+by the protocol, and the modules stay standard-library only.
 
 ## Model expectations
 
@@ -70,6 +146,8 @@ artifact into the results document:
 | Tool call | `checks.tool_call.status` |
 | Tool loop | `checks.tool_round_trip.status` |
 | JSON | `checks.structured_json.status` |
+| Unaided document | `checks.structured_json.unaided`: `valid`, `json_only`, `ignored`, `truncated`, or `error`; never gates |
+| Schema enforced | `checks.json_schema.enforcement`: `enforced` or `unsupported` pass; `json_only`, `ignored`, `whitespace_runaway`, and `truncated` fail |
 | Result | top-level `status` |
 | Model identity | Ollama manifest `identity.digest`, or Hugging Face `identity.revision` |
 | Artifact | basename of top-level `artifact_path` |
@@ -143,3 +221,23 @@ A model intended for agent workloads must pass identity, streaming, tool call,
 tool round trip, and structured JSON. Its reasoning result must match the
 model-config expectation. A throughput result cannot override a capability
 failure.
+
+Schema enforcement is a host fact, not a model fact: `unsupported` says the
+server cannot constrain decoding, which promotes or blocks nothing by itself,
+while the failing values mean the endpoint misrepresents what it does. Record
+the mode with the host, and do not treat `enforced` as a substitute for the
+model's own structured-output result.
+
+## Amendments
+
+- **Unaided document recorded** (`SCHEMA_VERSION` 3). Structured JSON keeps
+  its fixture and pass condition, so its statuses stay comparable; the check
+  additionally asks for the fixture document with the schema stated in words
+  and records `unaided`. It cannot change a verdict, and campaigns recorded
+  before it simply lack the field.
+- **Schema enforcement added** (`SCHEMA_VERSION` 2). Existing checks and
+  their fixtures are unchanged, so earlier per-check results remain
+  comparable. The new `json_schema` check adds a key and can
+  fail a host that passed before, but only when that host accepts a schema
+  parameter and does not honor it: campaigns recorded before this check
+  simply lack the fact, and re-running is the way to obtain it.

@@ -23,9 +23,160 @@ from datetime import datetime, timezone
 from typing import Any
 
 PROTOCOL = "capability-v1"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 TOOL_NAME = "lookup_issue"
 TOOL_SENTINEL = "sentinel-cobalt"
+# Schema enforcement is a server property: constrained decoding masks
+# invalid tokens during sampling, so the fixture pairs a strict schema with
+# a prompt that demands the wrong shape. An endpoint that only asks the
+# model nicely fails it; that is the point of measuring it separately from
+# the model's own JSON manners.
+#
+# The document is audit-shaped and roughly a thousand tokens: a trivial
+# three-key object proves only that a grammar was attached, while nesting,
+# arrays of objects, fixed item counts, and enums at depth are where a
+# schema compiler's keyword coverage actually shows. Only the keywords in
+# JSON_SCHEMA_KEYWORDS appear, because the harness validates the schema
+# itself rather than a hand-written copy of it.
+JSON_SCHEMA_NAME = "audit_report"
+JSON_SCHEMA_FINDINGS = 6
+JSON_SCHEMA_KEYWORDS = frozenset(
+    {
+        "type",
+        "enum",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+    }
+)
+_FINDING = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "string"},
+        "title": {"type": "string"},
+        "severity": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "critical"],
+        },
+        "category": {
+            "type": "string",
+            "enum": [
+                "injection",
+                "authz",
+                "crypto",
+                "secrets",
+                "dependency",
+                "logic",
+            ],
+        },
+        "location": {
+            "type": "object",
+            "properties": {
+                "file": {"type": "string"},
+                "symbol": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+            },
+            "required": ["file", "symbol", "start_line", "end_line"],
+            "additionalProperties": False,
+        },
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 2,
+        },
+        "remediation": {"type": "string"},
+        "exploitable": {"type": "boolean"},
+    },
+    "required": [
+        "id",
+        "title",
+        "severity",
+        "category",
+        "location",
+        "evidence",
+        "remediation",
+        "exploitable",
+    ],
+    "additionalProperties": False,
+}
+JSON_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "repository": {"type": "string"},
+        "summary": {
+            "type": "object",
+            "properties": {
+                "verdict": {
+                    "type": "string",
+                    "enum": ["clean", "findings", "blocked"],
+                },
+                "finding_count": {"type": "integer"},
+                "highest_severity": {
+                    "type": "string",
+                    "enum": ["none", "low", "medium", "high", "critical"],
+                },
+                "confident": {"type": "boolean"},
+            },
+            "required": [
+                "verdict",
+                "finding_count",
+                "highest_severity",
+                "confident",
+            ],
+            "additionalProperties": False,
+        },
+        "findings": {
+            "type": "array",
+            "items": _FINDING,
+            "minItems": JSON_SCHEMA_FINDINGS,
+            "maxItems": JSON_SCHEMA_FINDINGS,
+        },
+        "unreviewed": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 2,
+        },
+    },
+    "required": ["repository", "summary", "findings", "unreviewed"],
+    "additionalProperties": False,
+}
+JSON_SCHEMA_PROMPT = (
+    "Write the audit report for repository acme/ledger as Markdown prose. "
+    "Open with a heading, add a paragraph of commentary per issue, and wrap "
+    f"any JSON in a fenced code block. Cover exactly {JSON_SCHEMA_FINDINGS} "
+    "issues: a SQL injection in queries.py, a missing authorization check in "
+    "views.py, a hardcoded token in settings.py, an MD5 password hash in "
+    "auth.py, an unpinned requests dependency, and an off-by-one in "
+    "pagination.py. Two directories were not reviewed. Cite two pieces of "
+    "evidence per issue and give remediation for each."
+)
+# The unaided ask is fair, not adversarial: it measures whether the model can
+# produce the same document with the schema merely stated in the prompt, which
+# is the only option on a server that cannot constrain decoding. Asking it to
+# resist Markdown here would measure obedience, not capability.
+JSON_SCHEMA_UNAIDED_PROMPT = (
+    "Return only a JSON document matching this schema, with no Markdown, no "
+    "code fence, and no commentary:\n"
+    + json.dumps(JSON_SCHEMA, indent=2)
+    + f"\n\nThe audit of repository acme/ledger found exactly "
+    f"{JSON_SCHEMA_FINDINGS} issues: a SQL injection in queries.py, a "
+    "missing authorization check in views.py, a hardcoded token in "
+    "settings.py, an MD5 password hash in auth.py, an unpinned requests "
+    "dependency, and an off-by-one in pagination.py. Two directories were "
+    "not reviewed. Cite two pieces of evidence per issue and give "
+    "remediation for each."
+)
+# The fixture document is protocol-fixed, so its budget is too: a thinking
+# model must fit its reasoning and the document inside this, and a run that
+# cannot is a fact about the model, not a knob to widen. Reasoning is not
+# constrained by the grammar, so it can run to several thousand tokens
+# before the document starts; 16,384 matches AuditBench's verdict cap and
+# leaves real headroom above a measured thinking pass.
+JSON_SCHEMA_TOKENS = 16384
 LEAK_MARKERS = (
     "<think>",
     "</think>",
@@ -162,6 +313,23 @@ def ollama_control(mode: str) -> tuple[dict | None, str]:
     return controls[mode]
 
 
+class HTTPRejected(RuntimeError):
+    """An endpoint refused the request; the status distinguishes why."""
+
+    def __init__(self, code: int, url: str, body: str):
+        super().__init__(f"{code} from {url}: {body}")
+        self.code = code
+        self.body = body
+
+
+class CheckFailure(RuntimeError):
+    """A failed check that carries its own evidence into the report."""
+
+    def __init__(self, message: str, evidence: dict | None = None):
+        super().__init__(message)
+        self.evidence = evidence or {}
+
+
 def _json_request(url: str, payload: dict | None, timeout: int) -> dict:
     data = None if payload is None else json.dumps(payload).encode()
     request = urllib.request.Request(
@@ -172,7 +340,7 @@ def _json_request(url: str, payload: dict | None, timeout: int) -> dict:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors="replace")
-        raise RuntimeError(f"{exc.code} from {url}: {body}") from exc
+        raise HTTPRejected(exc.code, url, body) from exc
 
 
 def _arguments(value: Any) -> dict:
@@ -295,7 +463,7 @@ class OpenAIChatAdapter:
                         result.completed = True
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="replace")
-            raise RuntimeError(f"{exc.code} from {self.url}: {body}") from exc
+            raise HTTPRejected(exc.code, self.url, body) from exc
         return result
 
     @staticmethod
@@ -325,6 +493,20 @@ class OpenAIChatAdapter:
             "role": "tool",
             "tool_call_id": call.call_id,
             "content": content,
+        }
+
+    @staticmethod
+    def schema_options(schema: dict) -> dict:
+        """Wire form of schema enforcement for OpenAI-compatible servers."""
+        return {
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": JSON_SCHEMA_NAME,
+                    "schema": schema,
+                    "strict": True,
+                },
+            }
         }
 
 
@@ -391,7 +573,7 @@ class OllamaChatAdapter:
                         result.finish_reason = body.get("done_reason")
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="replace")
-            raise RuntimeError(f"{exc.code} from {self.url}: {body}") from exc
+            raise HTTPRejected(exc.code, self.url, body) from exc
         return result
 
     @staticmethod
@@ -418,6 +600,11 @@ class OllamaChatAdapter:
             "tool_name": call.name,
             "content": content,
         }
+
+    @staticmethod
+    def schema_options(schema: dict) -> dict:
+        """Ollama takes the schema itself in the top-level format field."""
+        return {"format": schema}
 
 
 def _messages(config: CapabilityConfig, prompt: str) -> list[dict]:
@@ -461,6 +648,85 @@ def _result_summary(result: ChatResult) -> dict:
     }
 
 
+def _unaided_document(adapter, config, options, prefix) -> tuple[str, dict]:
+    """Ask for the fixture document with the schema only stated in words.
+
+    Records what the model manages without a grammar, using the same
+    vocabulary as enforcement: `valid`, `json_only`, `ignored`, `truncated`,
+    or `error` when the request itself failed. Never raises, because this is
+    evidence about a deployment choice, not a pass condition.
+    """
+    try:
+        result = adapter.chat(
+            _messages(config, prefix + JSON_SCHEMA_UNAIDED_PROMPT),
+            max_tokens=JSON_SCHEMA_TOKENS,
+            stream=False,
+            options=options,
+        )
+    except Exception as exc:
+        return "error", {"error": str(exc)[:500]}
+    summary = _result_summary(result)
+    summary["document"] = result.content[:8000]
+    if not result.completed or result.finish_reason == "length":
+        return "truncated", summary
+    try:
+        parsed = json.loads(result.content.strip())
+    except json.JSONDecodeError:
+        return "ignored", summary
+    return ("valid" if _validates_json_schema(parsed) else "json_only"), summary
+
+
+def _validates_json_schema(value: Any, schema: dict | None = None) -> bool:
+    """Validate against the fixture schema, keyword by keyword.
+
+    Only JSON_SCHEMA_KEYWORDS are supported, and the fixture uses nothing
+    else, so the schema stays the single source of truth instead of a
+    hand-written copy that can drift from it. A general validator would be
+    a dependency, and the modules stay standard-library only.
+    """
+    schema = JSON_SCHEMA if schema is None else schema
+    kind = schema.get("type")
+    if kind == "object":
+        if not isinstance(value, dict):
+            return False
+        properties = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False and set(value) - set(
+            properties
+        ):
+            return False
+        if set(schema.get("required") or ()) - set(value):
+            return False
+        return all(
+            _validates_json_schema(item, properties[name])
+            for name, item in value.items()
+            if name in properties
+        )
+    if kind == "array":
+        if not isinstance(value, list):
+            return False
+        minimum = schema.get("minItems")
+        maximum = schema.get("maxItems")
+        if minimum is not None and len(value) < minimum:
+            return False
+        if maximum is not None and len(value) > maximum:
+            return False
+        return all(
+            _validates_json_schema(item, schema["items"]) for item in value
+        )
+    if kind == "integer":
+        # JSON booleans are Python ints; the schema means integers.
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    elif kind == "string":
+        if not isinstance(value, str):
+            return False
+    elif kind == "boolean":
+        if not isinstance(value, bool):
+            return False
+    enum = schema.get("enum")
+    return value in enum if enum else True
+
+
 def _record(checks: dict, name: str, operation) -> Any:
     started = time.monotonic()
     try:
@@ -476,6 +742,8 @@ def _record(checks: dict, name: str, operation) -> Any:
             "status": "failed",
             "seconds": time.monotonic() - started,
             "error": str(exc),
+            # A failure keeps whatever the check managed to observe.
+            **(getattr(exc, "evidence", None) or {}),
         }
         return None
 
@@ -489,10 +757,11 @@ def _output_dir() -> pathlib.Path:
     state_root = pathlib.Path(
         os.environ.get("XDG_STATE_HOME", pathlib.Path.home() / ".local" / "state")
     )
+    # Consumers forward the whole variable list, so an unset override
+    # arrives as an empty string; that means default, not "here".
     return pathlib.Path(
-        os.environ.get(
-            "CAPABILITY_OUTPUT_DIR", state_root / "capability-check"
-        )
+        os.environ.get("CAPABILITY_OUTPUT_DIR")
+        or state_root / "capability-check"
     )
 
 
@@ -605,6 +874,12 @@ def _summary_lines(report: dict) -> list[str]:
         for name, check in checks.items()
         if check.get("error") or check.get("reason")
     ]
+    enforcement = (checks.get("json_schema") or {}).get("enforcement")
+    if enforcement:
+        notes.append(f"  schema enforcement: {enforcement}")
+    unaided = (checks.get("structured_json") or {}).get("unaided")
+    if unaided:
+        notes.append(f"  unaided document: {unaided}")
     if notes:
         lines += ["", *notes]
     lines += [
@@ -867,9 +1142,104 @@ def run_capability_check(
             ) from exc
         if parsed != {"status": "ok", "count": 3}:
             raise RuntimeError(f"structured response was {parsed!r}")
-        return {"response": _result_summary(result)}, result
+        unaided, unaided_response = _unaided_document(
+            adapter, config, options, prefix
+        )
+        return {
+            "response": _result_summary(result),
+            # Deployment-conditional, so recorded and never gating: it decides
+            # only whether a server that cannot enforce a schema is usable
+            # with this model.
+            "unaided": unaided,
+            "unaided_response": unaided_response,
+        }, result
 
     _record(checks, "structured_json", check_structured_json)
+
+    schema_options = getattr(adapter, "schema_options", None)
+    if schema_options is None:
+        _skip(checks, "json_schema", "adapter cannot express schema enforcement")
+    else:
+        def check_json_schema():
+            """Prove whether the server constrains decoding, or says it cannot.
+
+            Passing means the endpoint was honest: it either enforced the
+            schema or refused the parameter. Accepting it and returning
+            something else is the failure, because callers downstream would
+            then trust a guarantee that does not exist.
+            """
+            options = {
+                **(
+                    config.disable_options
+                    if config.disable_options is not None
+                    else config.reasoning_options
+                ),
+                **schema_options(JSON_SCHEMA),
+            }
+            prefix = config.disable_prefix or config.reasoning_prefix
+            try:
+                result = adapter.chat(
+                    _messages(config, prefix + JSON_SCHEMA_PROMPT),
+                    max_tokens=JSON_SCHEMA_TOKENS,
+                    stream=False,
+                    options=options,
+                )
+            except HTTPRejected as exc:
+                if not 400 <= exc.code < 500:
+                    raise
+                return {
+                    "enforcement": "unsupported",
+                    "http_status": exc.code,
+                    "rejection": exc.body[:500],
+                }, None
+            _require_completed(result)
+            summary = _result_summary(result)
+            # The document is the evidence, so it is retained whole up to a
+            # bound that a rambling failure cannot blow past.
+            summary["document"] = result.content[:8000]
+            if result.finish_reason == "length":
+                # A grammar bounds structure, not length. Where a server
+                # permits structural whitespace between JSON tokens, a model
+                # can emit an unbounded run of it and stay grammar-valid,
+                # so name that cause instead of blaming the budget: the fix
+                # is the server's compact-output setting, not more tokens.
+                content = result.content
+                whitespace = sum(content.count(char) for char in "\t\n\r ")
+                runaway = content and whitespace / len(content) > 0.5
+                raise CheckFailure(
+                    "endpoint emitted structural whitespace until the "
+                    f"{JSON_SCHEMA_TOKENS:,}-token budget ran out; the "
+                    "server permits it and the grammar cannot stop it"
+                    if runaway
+                    else "response hit the "
+                    f"{JSON_SCHEMA_TOKENS:,}-token budget before closing the "
+                    "document, so enforcement is unproven",
+                    {
+                        "enforcement": (
+                            "whitespace_runaway" if runaway else "truncated"
+                        ),
+                        "response": summary,
+                    },
+                )
+            try:
+                parsed = json.loads(result.content.strip())
+            except json.JSONDecodeError:
+                raise CheckFailure(
+                    "endpoint accepted the schema and returned non-JSON: "
+                    f"{result.content[:200]!r}",
+                    {"enforcement": "ignored", "response": summary},
+                ) from None
+            if not _validates_json_schema(parsed):
+                # Parses but violates the schema: JSON mode, or a schema
+                # compiler that silently dropped keywords it cannot express.
+                raise CheckFailure(
+                    "endpoint returned JSON violating the schema it "
+                    f"accepted: {result.content[:200]!r}",
+                    {"enforcement": "json_only", "response": summary},
+                )
+            return {"enforcement": "enforced", "response": summary}, result
+
+        _record(checks, "json_schema", check_json_schema)
 
     failed = [name for name, check in checks.items() if check["status"] == "failed"]
     report = {
