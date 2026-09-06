@@ -67,10 +67,12 @@ class FakeAdapter:
         stream,
         tools=None,
         options=None,
-        force_tool=None,
     ):
-        del max_tokens, stream
+        del max_tokens
         prompt = str(messages[-1].get("content", ""))
+        has_tool_result = any(
+            message.get("role") == "tool" for message in messages
+        )
         if options and "response_format" in options:
             # A constrained server ignores the prose and obeys the schema.
             return ChatResult(
@@ -87,7 +89,7 @@ class FakeAdapter:
                 completed=True,
                 finish_reason="stop",
             )
-        if force_tool:
+        if tools and not has_tool_result and "Call lookup_issue" in prompt:
             return ChatResult(
                 tool_calls=[
                     ToolCall(
@@ -96,11 +98,11 @@ class FakeAdapter:
                         arguments={"issue_number": 42},
                     )
                 ],
-                chunks=1,
+                chunks=2 if stream else 1,
                 completed=True,
                 finish_reason="tool_calls",
             )
-        if any(message.get("role") == "tool" for message in messages):
+        if has_tool_result:
             return ChatResult(
                 content="sentinel-cobalt",
                 chunks=1,
@@ -163,7 +165,7 @@ class UnenforcingAdapter(FakeAdapter):
     """A server that accepts response_format and ignores it."""
 
     def chat(self, messages, *, max_tokens, stream, tools=None,
-             options=None, force_tool=None):
+             options=None):
         if options and "response_format" in options:
             return ChatResult(
                 content='## Audit\n\nOne finding.\n\n```json\n'
@@ -174,7 +176,7 @@ class UnenforcingAdapter(FakeAdapter):
             )
         return super().chat(
             messages, max_tokens=max_tokens, stream=stream, tools=tools,
-            options=options, force_tool=force_tool,
+            options=options,
         )
 
 
@@ -182,7 +184,7 @@ class RejectingAdapter(FakeAdapter):
     """A server without constrained decoding, refusing the parameter."""
 
     def chat(self, messages, *, max_tokens, stream, tools=None,
-             options=None, force_tool=None):
+             options=None):
         if options and "response_format" in options:
             raise HTTPRejected(
                 400, "http://x/v1/chat/completions",
@@ -190,7 +192,7 @@ class RejectingAdapter(FakeAdapter):
             )
         return super().chat(
             messages, max_tokens=max_tokens, stream=stream, tools=tools,
-            options=options, force_tool=force_tool,
+            options=options,
         )
 
 
@@ -198,7 +200,7 @@ class JsonOnlyAdapter(FakeAdapter):
     """A server that enforces JSON-ness but not the schema."""
 
     def chat(self, messages, *, max_tokens, stream, tools=None,
-             options=None, force_tool=None):
+             options=None):
         if options and "response_format" in options:
             # Valid JSON, one finding short and an enum it invented: the
             # shape a compiler produces when it drops keywords.
@@ -213,7 +215,7 @@ class JsonOnlyAdapter(FakeAdapter):
             )
         return super().chat(
             messages, max_tokens=max_tokens, stream=stream, tools=tools,
-            options=options, force_tool=force_tool,
+            options=options,
         )
 
 
@@ -221,7 +223,7 @@ class TruncatingAdapter(FakeAdapter):
     """A constrained response cut off at the token budget."""
 
     def chat(self, messages, *, max_tokens, stream, tools=None,
-             options=None, force_tool=None):
+             options=None):
         if options and "response_format" in options:
             return ChatResult(
                 content=conforming_document()[:200],
@@ -231,7 +233,7 @@ class TruncatingAdapter(FakeAdapter):
             )
         return super().chat(
             messages, max_tokens=max_tokens, stream=stream, tools=tools,
-            options=options, force_tool=force_tool,
+            options=options,
         )
 
 
@@ -239,7 +241,7 @@ class WhitespaceRunawayAdapter(FakeAdapter):
     """A grammar-valid whitespace loop: legal tokens, no document."""
 
     def chat(self, messages, *, max_tokens, stream, tools=None,
-             options=None, force_tool=None):
+             options=None):
         if options and "response_format" in options:
             return ChatResult(
                 content='{\n  "repository":' + "\t" * 4000,
@@ -249,7 +251,7 @@ class WhitespaceRunawayAdapter(FakeAdapter):
             )
         return super().chat(
             messages, max_tokens=max_tokens, stream=stream, tools=tools,
-            options=options, force_tool=force_tool,
+            options=options,
         )
 
 
@@ -257,7 +259,7 @@ class ProseAdapter(FakeAdapter):
     """A model that answers the unaided ask with a report, not a document."""
 
     def chat(self, messages, *, max_tokens, stream, tools=None,
-             options=None, force_tool=None):
+             options=None):
         prompt = str(messages[-1].get("content", ""))
         if "matching this schema" in prompt and not (
             options and "response_format" in options
@@ -271,7 +273,7 @@ class ProseAdapter(FakeAdapter):
             )
         return super().chat(
             messages, max_tokens=max_tokens, stream=stream, tools=tools,
-            options=options, force_tool=force_tool,
+            options=options,
         )
 
 
@@ -282,11 +284,13 @@ class SchemalessAdapter(FakeAdapter):
 
 
 class ToollessAdapter(FakeAdapter):
-    """A model that ignores a forced tool call, failing that check."""
+    """A model that ignores an automatic tool call, failing that check."""
 
     def chat(self, messages, *, max_tokens, stream, tools=None,
-             options=None, force_tool=None):
-        if force_tool:
+             options=None):
+        if tools and not any(
+            message.get("role") == "tool" for message in messages
+        ):
             return ChatResult(
                 content="I would rather answer from memory.",
                 chunks=1,
@@ -302,9 +306,144 @@ class ToollessAdapter(FakeAdapter):
         )
 
 
+class AdapterTest(unittest.TestCase):
+    def test_openai_non_streaming_tools_use_auto_choice(self):
+        body = {
+            "choices": [
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup_issue",
+                                    "arguments": '{"issue_number":42}',
+                                },
+                            }
+                        ]
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        adapter = capability_check.OpenAIChatAdapter("http://x", "m", 5)
+        with mock.patch.object(
+            capability_check, "_json_request", return_value=body
+        ) as request:
+            result = adapter.chat(
+                [{"role": "user", "content": "call it"}],
+                max_tokens=100,
+                stream=False,
+                tools=[capability_check.TOOL],
+            )
+        payload = request.call_args.args[1]
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertEqual(
+            result.tool_calls,
+            [
+                ToolCall(
+                    call_id="call-1",
+                    name="lookup_issue",
+                    arguments={"issue_number": 42},
+                )
+            ],
+        )
+
+    def test_openai_streaming_tools_use_auto_choice_and_assemble_call(self):
+        events = [
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            b'"id":"call-1","function":{"name":"lookup_",'
+            b'"arguments":"{\\"issue_"}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            b'"function":{"name":"issue","arguments":"number\\":"}}]}}]}\n',
+            b'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            b'"function":{"arguments":"42}"}}]},'
+            b'"finish_reason":"tool_calls"}]}\n',
+            b"data: [DONE]\n",
+        ]
+        response = mock.MagicMock()
+        response.__enter__.return_value = events
+        adapter = capability_check.OpenAIChatAdapter("http://x", "m", 5)
+        with mock.patch.object(
+            capability_check.urllib.request,
+            "urlopen",
+            return_value=response,
+        ) as urlopen:
+            result = adapter.chat(
+                [{"role": "user", "content": "call it"}],
+                max_tokens=100,
+                stream=True,
+                tools=[capability_check.TOOL],
+            )
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertEqual(
+            result.tool_calls,
+            [
+                ToolCall(
+                    call_id="call-1",
+                    name="lookup_issue",
+                    arguments={"issue_number": 42},
+                )
+            ],
+        )
+
+    def test_ollama_streaming_tools_collect_call(self):
+        events = [
+            json.dumps(
+                {
+                    "message": {
+                        "tool_calls": [
+                            {
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup_issue",
+                                    "arguments": {"issue_number": 42},
+                                },
+                            }
+                        ]
+                    },
+                    "done": False,
+                }
+            ).encode()
+            + b"\n",
+            b'{"message":{},"done":true,"done_reason":"stop"}\n',
+        ]
+        response = mock.MagicMock()
+        response.__enter__.return_value = events
+        adapter = capability_check.OllamaChatAdapter("http://x", "m", 5)
+        with mock.patch.object(
+            capability_check.urllib.request,
+            "urlopen",
+            return_value=response,
+        ):
+            result = adapter.chat(
+                [{"role": "user", "content": "call it"}],
+                max_tokens=100,
+                stream=True,
+                tools=[capability_check.TOOL],
+            )
+        self.assertEqual(
+            result.tool_calls,
+            [
+                ToolCall(
+                    call_id=None,
+                    name="lookup_issue",
+                    arguments={"issue_number": 42},
+                )
+            ],
+        )
+
+
 class CapabilityCheckTest(unittest.TestCase):
     @staticmethod
-    def _run(output_format: str, directory: str, **overrides) -> tuple[int, str]:
+    def _run(
+        output_format: str,
+        directory: str,
+        adapter=None,
+        **overrides,
+    ) -> tuple[int, str]:
         output = io.StringIO()
         with mock.patch.dict(
             os.environ, {"CAPABILITY_OUTPUT_DIR": directory}, clear=False
@@ -314,7 +453,7 @@ class CapabilityCheckTest(unittest.TestCase):
                     runtime="fake",
                     tag="fixture",
                     model="fixture",
-                    adapter=FakeAdapter(),
+                    adapter=adapter or FakeAdapter(),
                     config=CapabilityConfig(
                         reasoning="required",
                         tools="required",
@@ -340,6 +479,7 @@ class CapabilityCheckTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(artifacts), 1)
         report = json.loads(text)
+        self.assertEqual(report["schema_version"], 4)
         self.assertEqual(report["protocol"], "capability-v1")
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["failed_checks"], [])
@@ -358,6 +498,7 @@ class CapabilityCheckTest(unittest.TestCase):
             "streaming_reasoning",
             "thinking_disabled",
             "tool_call",
+            "streaming_tool_call",
             "tool_round_trip",
             "structured_json",
             "json_schema",
@@ -396,6 +537,51 @@ class CapabilityCheckTest(unittest.TestCase):
         self.assertIn("tool_round_trip skipped: tool_call failed", text)
         self.assertIn("identity: unchecked", text)
         self.assertIn("result: FAILED (model_identity, tool_call", text)
+
+    def test_automatic_tool_paths_fail_independently(self):
+        class BrokenToolParserAdapter(FakeAdapter):
+            def __init__(self, broken_stream):
+                self.broken_stream = broken_stream
+
+            def chat(self, messages, *, max_tokens, stream, tools=None,
+                     options=None):
+                initial_tool_call = tools and not any(
+                    message.get("role") == "tool" for message in messages
+                )
+                if initial_tool_call and stream == self.broken_stream:
+                    if stream:
+                        raise RuntimeError("streaming tool parser failed")
+                    return ChatResult(
+                        content="<tool_call>raw XML</tool_call>",
+                        chunks=1,
+                        completed=True,
+                        finish_reason="stop",
+                    )
+                return super().chat(
+                    messages,
+                    max_tokens=max_tokens,
+                    stream=stream,
+                    tools=tools,
+                    options=options,
+                )
+
+        cases = (
+            (False, "tool_call", "streaming_tool_call"),
+            (True, "streaming_tool_call", "tool_call"),
+        )
+        for broken_stream, failed, passed in cases:
+            with self.subTest(failed=failed):
+                with tempfile.TemporaryDirectory() as directory:
+                    code, text = self._run(
+                        "json",
+                        directory,
+                        adapter=BrokenToolParserAdapter(broken_stream),
+                    )
+                report = json.loads(text)
+            self.assertEqual(code, 1)
+            self.assertEqual(report["checks"][failed]["status"], "failed")
+            self.assertEqual(report["checks"][passed]["status"], "passed")
+            self.assertEqual(report["failed_checks"], [failed])
 
     def test_enforcement_modes_are_recorded_and_only_lying_fails(self):
         cases = {
@@ -513,7 +699,7 @@ class CapabilityCheckTest(unittest.TestCase):
     def test_unaided_records_a_truncated_or_failed_attempt(self):
         class TruncatedUnaided(FakeAdapter):
             def chat(self, messages, *, max_tokens, stream, tools=None,
-                     options=None, force_tool=None):
+                     options=None):
                 prompt = str(messages[-1].get("content", ""))
                 if "matching this schema" in prompt:
                     return ChatResult(
@@ -524,18 +710,18 @@ class CapabilityCheckTest(unittest.TestCase):
                     )
                 return super().chat(
                     messages, max_tokens=max_tokens, stream=stream,
-                    tools=tools, options=options, force_tool=force_tool,
+                    tools=tools, options=options,
                 )
 
         class BrokenUnaided(FakeAdapter):
             def chat(self, messages, *, max_tokens, stream, tools=None,
-                     options=None, force_tool=None):
+                     options=None):
                 prompt = str(messages[-1].get("content", ""))
                 if "matching this schema" in prompt:
                     raise HTTPRejected(500, "http://x", "upstream exploded")
                 return super().chat(
                     messages, max_tokens=max_tokens, stream=stream,
-                    tools=tools, options=options, force_tool=force_tool,
+                    tools=tools, options=options,
                 )
 
         for adapter_class, unaided in (

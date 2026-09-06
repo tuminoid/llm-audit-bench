@@ -9,9 +9,9 @@ workloads. Two instruments, one target: any OpenAI-compatible endpoint.
   profiles. Spec: [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - **Capability Check v1** (`capability-check`) is the pass/fail API
   compatibility gate: streaming reasoning, thinking-disabled control, tool
-  call, tool round trip, structured JSON with a measured unaided document,
-  and whether the server enforces a JSON schema or admits it cannot. Spec:
-  [docs/CAPABILITY.md](docs/CAPABILITY.md).
+  calls in non-streaming and streaming modes, tool round trip, structured JSON
+  with a measured unaided document, and whether the server enforces a JSON
+  schema or admits it cannot. Spec: [docs/CAPABILITY.md](docs/CAPABILITY.md).
 
 Neither scores answer quality. Benchmark rates and capability verdicts are
 different facts; keep them separate.

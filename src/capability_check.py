@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 PROTOCOL = "capability-v1"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 TOOL_NAME = "lookup_issue"
 TOOL_SENTINEL = "sentinel-cobalt"
 # Schema enforcement is a server property: constrained decoding masks
@@ -185,6 +185,8 @@ LEAK_MARKERS = (
     "<|channel>",
     "<|channel|>",
     "<|tool_call>",
+    "<tool_call>",
+    "</tool_call>",
 )
 TOOL = {
     "type": "function",
@@ -404,7 +406,6 @@ class OpenAIChatAdapter:
         stream: bool,
         tools: list[dict] | None = None,
         options: dict | None = None,
-        force_tool: str | None = None,
     ) -> ChatResult:
         payload = {
             "model": self.model,
@@ -416,11 +417,7 @@ class OpenAIChatAdapter:
         }
         if tools:
             payload["tools"] = tools
-        if force_tool:
-            payload["tool_choice"] = {
-                "type": "function",
-                "function": {"name": force_tool},
-            }
+            payload["tool_choice"] = "auto"
         if not stream:
             body = _json_request(self.url, payload, self.timeout)
             choices = body.get("choices") or []
@@ -444,6 +441,7 @@ class OpenAIChatAdapter:
             headers={"Content-Type": "application/json"},
         )
         result = ChatResult()
+        tool_call_parts: dict[int, dict] = {}
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 for raw_line in response:
@@ -466,12 +464,46 @@ class OpenAIChatAdapter:
                     result.legacy_reasoning += str(
                         delta.get("reasoning_content") or ""
                     )
+                    for call_delta in delta.get("tool_calls") or []:
+                        index = call_delta.get("index")
+                        if not isinstance(index, int):
+                            raise RuntimeError(
+                                "streaming OpenAI tool call omitted its index"
+                            )
+                        call = tool_call_parts.setdefault(
+                            index,
+                            {
+                                "id": None,
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        if call_delta.get("id") is not None:
+                            call["id"] = str(call_delta["id"])
+                        function = call_delta.get("function") or {}
+                        if function.get("name") is not None:
+                            call["function"]["name"] += str(function["name"])
+                        if function.get("arguments") is not None:
+                            arguments = function["arguments"]
+                            if not isinstance(arguments, str):
+                                raise RuntimeError(
+                                    "streaming OpenAI tool arguments were "
+                                    "not text"
+                                )
+                            call["function"]["arguments"] += arguments
                     if choice.get("finish_reason") is not None:
                         result.finish_reason = choice["finish_reason"]
                         result.completed = True
         except urllib.error.HTTPError as exc:
             body = exc.read().decode(errors="replace")
             raise HTTPRejected(exc.code, self.url, body) from exc
+        result.tool_calls = _openai_tool_calls(
+            {
+                "tool_calls": [
+                    tool_call_parts[index] for index in sorted(tool_call_parts)
+                ]
+            }
+        )
         return result
 
     @staticmethod
@@ -532,9 +564,7 @@ class OllamaChatAdapter:
         stream: bool,
         tools: list[dict] | None = None,
         options: dict | None = None,
-        force_tool: str | None = None,
     ) -> ChatResult:
-        del force_tool
         payload = {
             "model": self.model,
             "messages": messages,
@@ -576,6 +606,7 @@ class OllamaChatAdapter:
                     result.chunks += 1
                     result.content += str(message.get("content") or "")
                     result.reasoning += str(message.get("thinking") or "")
+                    result.tool_calls.extend(_ollama_tool_calls(message))
                     if body.get("done"):
                         result.completed = True
                         result.finish_reason = body.get("done_reason")
@@ -634,6 +665,24 @@ def _require_completed(result: ChatResult) -> None:
         raise RuntimeError("chat response did not complete")
     if result.legacy_reasoning:
         raise RuntimeError("reasoning arrived in legacy reasoning_content")
+
+
+def _require_tool_call(result: ChatResult) -> ToolCall:
+    _require_completed(result)
+    _no_leak(result.content)
+    if len(result.tool_calls) != 1:
+        raise RuntimeError(
+            f"expected one tool call, found {len(result.tool_calls)}"
+        )
+    call = result.tool_calls[0]
+    if call.name != TOOL_NAME:
+        raise RuntimeError(f"model called {call.name!r}, expected {TOOL_NAME}")
+    if call.arguments != {"issue_number": 42}:
+        raise RuntimeError(
+            f"tool arguments were {call.arguments!r}, "
+            "expected {'issue_number': 42}"
+        )
+    return call
 
 
 def _result_summary(result: ChatResult) -> dict:
@@ -1053,6 +1102,11 @@ def run_capability_check(
     tool_state = {}
     if config.tools == "absent":
         _skip(checks, "tool_call", "model is configured without tools")
+        _skip(
+            checks,
+            "streaming_tool_call",
+            "model is configured without tools",
+        )
         _skip(checks, "tool_round_trip", "model is configured without tools")
     else:
         user_prompt = (
@@ -1070,28 +1124,30 @@ def run_capability_check(
                 stream=False,
                 tools=[TOOL],
                 options=config.reasoning_options,
-                force_tool=TOOL_NAME,
             )
-            _require_completed(result)
-            _no_leak(result.content)
-            if len(result.tool_calls) != 1:
-                raise RuntimeError(
-                    f"expected one tool call, found {len(result.tool_calls)}"
-                )
-            call = result.tool_calls[0]
-            if call.name != TOOL_NAME:
-                raise RuntimeError(f"model called {call.name!r}, expected {TOOL_NAME}")
-            if call.arguments != {"issue_number": 42}:
-                raise RuntimeError(
-                    f"tool arguments were {call.arguments!r}, "
-                    "expected {'issue_number': 42}"
-                )
+            call = _require_tool_call(result)
             tool_state["result"] = result
             tool_state["call"] = call
             tool_state["messages"] = initial_messages
             return {"response": _result_summary(result)}, result
 
         tool_result = _record(checks, "tool_call", check_tool_call)
+
+        def check_streaming_tool_call():
+            result = adapter.chat(
+                initial_messages,
+                max_tokens=timeout_tokens,
+                stream=True,
+                tools=[TOOL],
+                options=config.reasoning_options,
+            )
+            if result.chunks < 1:
+                raise RuntimeError("tool-call stream had no chunks")
+            _require_tool_call(result)
+            return {"response": _result_summary(result)}, result
+
+        _record(checks, "streaming_tool_call", check_streaming_tool_call)
+
         if tool_result is None:
             _skip(checks, "tool_round_trip", "tool_call failed")
         else:

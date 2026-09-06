@@ -17,7 +17,8 @@ The protocol uses fixed local fixtures:
 | Model identity | The live server matches the requested model: the managed launch artifact for adapters, the endpoint's own model listing for standalone runs |
 | Streaming reasoning | The stream completes, final content is correct, reasoning uses the dedicated field, and no raw markers leak |
 | Thinking disabled | When configured, the documented control produces correct content with an empty reasoning field |
-| Tool call | Exactly one `lookup_issue` call carries `{"issue_number": 42}` |
+| Tool call | With automatic tool choice, one non-streaming `lookup_issue` call carries `{"issue_number": 42}` |
+| Streaming tool call | With automatic tool choice, one streamed `lookup_issue` call is assembled with `{"issue_number": 42}` |
 | Tool round trip | The model consumes the returned `sentinel-cobalt` value and finishes without another tool call |
 | Structured JSON | The final content is the exact requested JSON object, without Markdown cleanup. The same check records, without gating, what the model manages when asked for the full fixture document with the schema stated in words (`unaided`) |
 | JSON schema | The endpoint is honest about schema enforcement: it either constrains decoding to the fixture schema, or refuses the parameter with a 4xx. Accepting it and returning anything else fails |
@@ -26,9 +27,12 @@ The reasoning fixture allows enough output for models whose thought phase is
 longer than their answer. Results retain content excerpts and field lengths,
 not reasoning text.
 
-The OpenAI-compatible adapters use named `tool_choice`. Ollama's native
-`/api/chat` has no equivalent force parameter, so its fixed prompt requires
-the call and the same exact name and arguments are validated afterward.
+The OpenAI-compatible adapters explicitly use `tool_choice: auto` for both
+tool-call checks. This exercises the model's own tool syntax and the server's
+configured parser; a named choice can invoke guided decoding and bypass both.
+Ollama's native `/api/chat` has no tool-choice parameter, so offering tools has
+the same automatic semantics. The fixed prompt requires the call, and both
+paths validate the same exact name and arguments.
 
 ### Model manners versus server enforcement
 
@@ -157,6 +161,7 @@ artifact into the results document:
 | Reasoning | `checks.streaming_reasoning.status` |
 | Thinking off | `checks.thinking_disabled.status`; use `unsupported` only when it is `skipped` because the model config declares no disable mode |
 | Tool call | `checks.tool_call.status` |
+| Streaming tool call | `checks.streaming_tool_call.status` |
 | Tool loop | `checks.tool_round_trip.status` |
 | JSON | `checks.structured_json.status` |
 | Unaided document | `checks.structured_json.unaided`: `valid`, `json_only`, `ignored`, `truncated`, or `error`; never gates |
@@ -230,10 +235,10 @@ automatic when it is provably safe.
 
 ### Promotion rule
 
-A model intended for agent workloads must pass identity, streaming, tool call,
-tool round trip, and structured JSON. Its reasoning result must match the
-model-config expectation. A throughput result cannot override a capability
-failure.
+A model intended for agent workloads must pass identity, streaming reasoning,
+non-streaming and streaming tool calls, tool round trip, and structured JSON.
+Its reasoning result must match the model-config expectation. A throughput
+result cannot override a capability failure.
 
 Schema enforcement is a host fact, not a model fact: `unsupported` says the
 server cannot constrain decoding, which promotes or blocks nothing by itself,
@@ -243,6 +248,12 @@ model's own structured-output result.
 
 ## Amendments
 
+- **Automatic tool parsing covered** (`SCHEMA_VERSION` 4). The tool-call
+  fixture now uses automatic rather than named choice, and a second check runs
+  it over streaming. Named choice could let guided decoding bypass the model's
+  tool syntax and the configured parser, so earlier tool-call passes do not
+  establish parser compatibility and must be rerun. Other per-check results
+  remain comparable.
 - **Unaided document recorded** (`SCHEMA_VERSION` 3). Structured JSON keeps
   its fixture and pass condition, so its statuses stay comparable; the check
   additionally asks for the fixture document with the schema stated in words
