@@ -291,6 +291,14 @@ def openai_control(mode: str) -> tuple[dict, str]:
             {"chat_template_kwargs": {"enable_thinking": False}},
             "",
         ),
+        "reasoning-effort-high": (
+            {"chat_template_kwargs": {"reasoning_effort": "high"}},
+            "",
+        ),
+        "reasoning-effort-none": (
+            {"chat_template_kwargs": {"reasoning_effort": "none"}},
+            "",
+        ),
         "think-prefix": ({}, "/think\n"),
         "no-think-prefix": ({}, "/no_think\n"),
         "none": (None, ""),
@@ -1357,7 +1365,8 @@ def main(argv: list[str] | None = None) -> int:
         default="default",
         help=(
             "documented control enabling reasoning; openai: default, "
-            "enable-thinking, enable-thinking-false, think-prefix, "
+            "enable-thinking, enable-thinking-false, "
+            "reasoning-effort-high, reasoning-effort-none, think-prefix, "
             "no-think-prefix, none; ollama: default, think-true, "
             "think-false, none"
         ),

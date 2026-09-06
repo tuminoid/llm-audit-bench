@@ -119,6 +119,19 @@ These are model facts. Do not infer them from parser names or manifest
 capability lists: manifests can omit working tools, and a configured reasoning
 parser does not mean thinking is enabled by default.
 
+Controls differ by model family, so the mode names spell out the wire form
+rather than an intent. `enable-thinking` and `enable-thinking-false` send the
+`enable_thinking` chat-template kwarg; `reasoning-effort-high` and
+`reasoning-effort-none` send `reasoning_effort`, the control used by families
+that grade reasoning instead of toggling it; `think-prefix` and
+`no-think-prefix` prepend an in-band marker. `reasoning_effort` travels as a
+chat-template kwarg because servers forward kwargs to the template
+generically, while top-level handling of that field is model-specific.
+
+A model whose reasoning is off by default is still a reasoning model: declare
+the control that turns it on. `none` means the model documents no such
+control, not that the default happens to suit the check.
+
 ## How results are generated
 
 Every run retains its complete JSON report on disk before printing

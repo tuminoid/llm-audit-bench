@@ -632,6 +632,17 @@ class CapabilityCheckTest(unittest.TestCase):
             ({"chat_template_kwargs": {"enable_thinking": True}}, ""),
         )
         self.assertEqual(ollama_control("think-false"), ({"think": False}, ""))
+        # reasoning_effort travels as a chat-template kwarg, not a
+        # top-level field: servers forward the kwarg to the template
+        # generically, while top-level handling is model-specific.
+        self.assertEqual(
+            openai_control("reasoning-effort-high"),
+            ({"chat_template_kwargs": {"reasoning_effort": "high"}}, ""),
+        )
+        self.assertEqual(
+            openai_control("reasoning-effort-none"),
+            ({"chat_template_kwargs": {"reasoning_effort": "none"}}, ""),
+        )
         with self.assertRaises(ValueError):
             openai_control("guessed")
 
