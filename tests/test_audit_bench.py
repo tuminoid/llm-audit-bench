@@ -658,6 +658,7 @@ class AuditBenchTest(unittest.TestCase):
         extra_env: dict,
         output_format: str = "json",
         openai_chat=None,
+        request=None,
     ) -> tuple[int, str]:
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory:
@@ -673,7 +674,7 @@ class AuditBenchTest(unittest.TestCase):
                         tag="fake-model",
                         model="fake-model",
                         context=131072,
-                        request=self._fake_request,
+                        request=request or self._fake_request,
                         active_slots=1,
                         kv_pool_tokens=131072,
                         output_format=output_format,
@@ -685,7 +686,7 @@ class AuditBenchTest(unittest.TestCase):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
         self.assertEqual(result, 0)
         report = json.loads(text.splitlines()[-1])
-        self.assertEqual(report["schema_version"], 5)
+        self.assertEqual(report["schema_version"], 6)
         self.assertEqual(report["protocol"], "audit-v1")
         self.assertFalse(report["publishable"])
         self.assertIn("capacity_near", report)
@@ -711,7 +712,7 @@ class AuditBenchTest(unittest.TestCase):
             self.assertEqual(len(retained), 1)
             self.assertIn(f"json: {retained[0]}", text)
             report = json.loads(retained[0].read_text(encoding="utf-8"))
-        self.assertEqual(report["schema_version"], 5)
+        self.assertEqual(report["schema_version"], 6)
         self.assertEqual(report["artifact_path"], str(retained[0]))
         self.assertIn("audits", report)
 
@@ -851,6 +852,54 @@ class AuditBenchTest(unittest.TestCase):
             os.environ, {"AUDIT_BENCH_REASONING_EFFORT": "none"}, clear=False
         ):
             self.assertTrue(Settings.from_env().canonical)
+
+    @classmethod
+    def _reports_one_fewer(cls, finish_reason: str):
+        def request(prompt: str, max_tokens: int, seed: int) -> RequestResult:
+            return dataclasses.replace(
+                cls._fake_request(prompt, max_tokens, seed),
+                output_tokens=max_tokens - 1,
+                details={"finish_reason": finish_reason},
+            )
+
+        return request
+
+    def test_off_by_one_tolerance_is_exact_and_noncanonical(self):
+        result, text = self._run_fake_protocol(
+            {"AUDIT_BENCH_TOLERATE_OFF_BY_ONE": "1"},
+            request=self._reports_one_fewer("length"),
+        )
+        self.assertEqual(result, 0)
+        report = json.loads(text.splitlines()[-1])
+        self.assertTrue(report["settings"]["tolerate_off_by_one"])
+        self.assertFalse(report["canonical"])
+
+    def test_off_by_one_tolerance_rejects_natural_stops_and_exact_counts(self):
+        env = {"AUDIT_BENCH_TOLERATE_OFF_BY_ONE": "1"}
+        for request in (self._reports_one_fewer("stop"), None):
+            with self.assertRaisesRegex(RuntimeError, "one fewer"):
+                self._run_fake_protocol(env, request=request)
+
+    def test_adapter_records_finish_reason(self):
+        def fake_urlopen(request, timeout=None):
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, t, e, tb):
+                    return False
+
+                def read(self):
+                    return json.dumps({
+                        "choices": [{"finish_reason": "length"}],
+                        "usage": {"prompt_tokens": 5, "completion_tokens": 1},
+                    })
+
+            return _Resp()
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            result = OpenAIChatAdapter("http://127.0.0.1:1", "m", 10)("hi", 1, 0)
+        self.assertEqual(result.details, {"finish_reason": "length"})
 
     def test_adapter_sends_reasoning_effort_only_when_set(self):
         captured = {}

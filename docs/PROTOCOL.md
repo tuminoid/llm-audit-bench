@@ -121,6 +121,25 @@ and the control does not affect `canonical`, so existing results remain
 comparable; the only output change is a new `settings.reasoning_effort`
 key, hence `SCHEMA_VERSION` 4.
 
+### Off-by-one token accounting
+
+Amendment (2026-09-24): some servers report `completion_tokens` one lower
+than they decoded when the length cap cuts a response. LM Studio's MLX
+engine (mlx-llm 1.11.0) reports 0 for `max_tokens` 1 and 49 for 50, all
+with `finish_reason` `length`, so the warmup rejects it.
+`AUDIT_BENCH_TOLERATE_OFF_BY_ONE=1` accepts such a server:
+
+- The gate stays exact. Every warmup and phase response must report exactly
+  one fewer than requested, and must say the length cap cut it. A natural
+  stop at that count, or a server that reports exact counts, still fails.
+- The run is `canonical: false`, and therefore not publishable. Metrics use
+  the server-reported counts unchanged; a reader comparing against exact
+  servers applies the recorded offset.
+- The setting is recorded as `settings.tolerate_off_by_one`, and the OpenAI
+  adapter now records each response's `finish_reason` in `adapter_details`,
+  hence `SCHEMA_VERSION` 6. No workload or canonical setting changed, so
+  existing results remain comparable.
+
 Before measuring, each adapter verifies the live model identity, configured
 context, and active slot count where the runtime exposes them. A forgotten
 startup override therefore fails rather than producing a mislabeled result.

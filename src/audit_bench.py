@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Callable
 
 PROTOCOL = "audit-v1"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 COMMON_PREFILL_TARGETS = (32768, 65536, 131072)
 DEFAULT_STREAMS = (1, 2, 4, 8)
 DEFAULT_DEEP_STREAMS = (1, 2, 4)
@@ -238,6 +238,7 @@ class Settings:
     gate_cmd: str | None = None
     system_prompt: str | None = None
     reasoning_effort: str | None = None
+    tolerate_off_by_one: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -342,6 +343,9 @@ class Settings:
             system_prompt=os.environ.get("AUDIT_BENCH_SYSTEM_PROMPT") or None,
             reasoning_effort=os.environ.get("AUDIT_BENCH_REASONING_EFFORT")
             or None,
+            tolerate_off_by_one=os.environ.get(
+                "AUDIT_BENCH_TOLERATE_OFF_BY_ONE", "0"
+            ) == "1",
         )
 
     @property
@@ -368,6 +372,7 @@ class Settings:
             and self.output_tokens == DEFAULT_OUTPUT_TOKENS
             and self.deep_output_tokens == DEFAULT_DEEP_OUTPUT_TOKENS
             and self.tolerance == DEFAULT_TOLERANCE
+            and not self.tolerate_off_by_one
         )
 
     def to_dict(self) -> dict:
@@ -669,10 +674,12 @@ class OpenAIChatAdapter:
             message = exc.read().decode(errors="replace")
             raise RuntimeError(f"{exc.code} from {self.url}: {message}") from exc
         usage = body.get("usage") or {}
+        choice = (body.get("choices") or [{}])[0]
         return RequestResult(
             prompt_tokens=int(usage.get("prompt_tokens", 0)),
             output_tokens=int(usage.get("completion_tokens", 0)),
             seconds=time.monotonic() - started,
+            details={"finish_reason": choice.get("finish_reason")},
         )
 
 
@@ -751,6 +758,30 @@ def _run_parallel(
     return results, time.monotonic() - started
 
 
+OFF_BY_ONE_EXPECTATION = (
+    "AUDIT_BENCH_TOLERATE_OFF_BY_ONE=1 expects one fewer with "
+    "finish_reason length; unset it for an exact backend"
+)
+
+
+def _output_matches(
+    result: RequestResult, expected: int, off_by_one: bool
+) -> bool:
+    """True when a response reports the requested output count.
+
+    With the off-by-one tolerance (docs/PROTOCOL.md) a server that reports
+    one token fewer than it decoded on length-capped responses matches
+    exactly at that offset, and only when it says the cap cut the response;
+    a natural stop at the same count is still short.
+    """
+    if not off_by_one:
+        return result.output_tokens == expected
+    return (
+        result.details.get("finish_reason") == "length"
+        and result.output_tokens == expected - 1
+    )
+
+
 def _validate_results(
     results: list[RequestResult],
     expected_output: int,
@@ -758,11 +789,14 @@ def _validate_results(
     context: int,
     tolerance: float,
     near_context: bool,
+    off_by_one: bool = False,
 ) -> None:
     outputs = [result.output_tokens for result in results]
-    if any(output != expected_output for output in outputs):
+    if not all(_output_matches(result, expected_output, off_by_one)
+               for result in results):
         raise RuntimeError(
             f"output token count was {outputs}, expected {expected_output} per stream"
+            + (f" ({OFF_BY_ONE_EXPECTATION})" if off_by_one else "")
         )
     prompts = [result.prompt_tokens for result in results]
     if any(prompt <= 0 for prompt in prompts):
@@ -1559,6 +1593,7 @@ def _measure_once(
     target_prompt: int | None = None,
     near_context: bool = False,
     gate_cmd: str | None = None,
+    off_by_one: bool = False,
 ) -> dict:
     _wait_for_gate(gate_cmd)
     if prompt_lines is None:
@@ -1587,6 +1622,7 @@ def _measure_once(
         context,
         tolerance,
         near_context,
+        off_by_one,
     )
     row = _sample_metrics(results, wall_seconds, sample_index + 1)
     prompt_range = row["prompt_tokens_per_stream"]
@@ -1616,6 +1652,7 @@ def _measure(
     gate_cmd: str | None = None,
     min_samples: int | None = None,
     agreement: float | None = None,
+    off_by_one: bool = False,
 ) -> dict:
     initial = min(min_samples or samples, samples)
     rows = [
@@ -1632,6 +1669,7 @@ def _measure(
             target_prompt=target_prompt,
             near_context=near_context,
             gate_cmd=gate_cmd,
+            off_by_one=off_by_one,
         )
         for sample_index in range(initial)
     ]
@@ -1658,6 +1696,7 @@ def _measure(
                 target_prompt=target_prompt,
                 near_context=near_context,
                 gate_cmd=gate_cmd,
+                off_by_one=off_by_one,
             )
         )
     return _summarize_measurements(streams, rows)
@@ -1695,6 +1734,7 @@ def _measure_family(
                     target_prompt=target_prompt,
                     near_context=near_context,
                     gate_cmd=settings.gate_cmd,
+                    off_by_one=settings.tolerate_off_by_one,
                 )
             )
 
@@ -2230,11 +2270,15 @@ def run_benchmark(
 
     print("warmup:")
     warmup = request("Reply with the single word ok.", 1, 1)
-    if warmup.output_tokens != 1:
+    if not _output_matches(warmup, 1, settings.tolerate_off_by_one):
         raise RuntimeError(
             "warmup did not return exactly one output token; "
             f"endpoint reported {warmup.output_tokens} for model {model!r} "
-            "(backends must honor max_tokens exactly)"
+            + (
+                f"({OFF_BY_ONE_EXPECTATION})"
+                if settings.tolerate_off_by_one
+                else "(backends must honor max_tokens exactly)"
+            )
         )
 
     if settings.profile == "decode":
@@ -2327,6 +2371,7 @@ def run_benchmark(
             gate_cmd=settings.gate_cmd,
             min_samples=settings.min_samples,
             agreement=settings.sample_agreement,
+            off_by_one=settings.tolerate_off_by_one,
         )
 
     near_plan = plan["capacity_near"]
