@@ -307,6 +307,56 @@ class ToollessAdapter(FakeAdapter):
 
 
 class AdapterTest(unittest.TestCase):
+    def test_openai_reasoning_aliases(self):
+        cases = [
+            ({"reasoning": "17 * 23"}, "17 * 23", ""),
+            ({"reasoning_content": "17 * 23"}, "17 * 23", "17 * 23"),
+            ({"reasoning": None, "reasoning_content": "17 * 23"},
+             "17 * 23", "17 * 23"),
+            ({"reasoning": "17 * 23", "reasoning_content": "17 * 23"},
+             "17 * 23", "17 * 23"),
+            ({}, "", ""),
+        ]
+        for stream in (False, True):
+            for fields, reasoning, legacy in cases:
+                with self.subTest(stream=stream, fields=fields):
+                    result = self._openai_reasoning_response(fields, stream)
+                    self.assertEqual(result.content, "391")
+                    self.assertEqual(result.reasoning, reasoning)
+                    self.assertEqual(result.legacy_reasoning, legacy)
+                    capability_check._require_completed(result)
+            with self.subTest(stream=stream, conflict=True):
+                with self.assertRaisesRegex(RuntimeError, "conflicting"):
+                    self._openai_reasoning_response(
+                        {"reasoning": "one", "reasoning_content": "two"},
+                        stream,
+                    )
+
+    @staticmethod
+    def _openai_reasoning_response(fields, stream):
+        message = {"content": "391", **fields}
+        body = {"choices": [{"message": message, "finish_reason": "stop"}]}
+        # Separate alias events prove normalization follows assembly rather
+        # than concatenating duplicated fields or comparing chunk boundaries.
+        deltas = [{key: value} for key, value in fields.items()]
+        deltas.append({"content": "391"})
+        events = [
+            ("data: " + json.dumps({"choices": [{"delta": delta}]})
+             + "\n").encode()
+            for delta in deltas
+        ] + [b"data: [DONE]\n"]
+        response = mock.MagicMock()
+        response.__enter__.return_value = events
+        with mock.patch.object(
+            capability_check, "_json_request", return_value=body
+        ), mock.patch.object(
+            capability_check.urllib.request, "urlopen", return_value=response
+        ):
+            return capability_check.OpenAIChatAdapter("http://x", "m", 5).chat(
+                [{"role": "user", "content": "calculate"}],
+                max_tokens=100, stream=stream,
+            )
+
     def test_openai_non_streaming_tools_use_auto_choice(self):
         body = {
             "choices": [
@@ -484,6 +534,45 @@ class CapabilityCheckTest(unittest.TestCase):
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["failed_checks"], [])
         self.assertEqual(artifact_report["status"], "passed")
+
+    def test_reasoning_alias_keeps_protocol_guards(self):
+        for scenario in ("valid", "disabled_reasoning", "content_leak"):
+            with self.subTest(scenario=scenario):
+                adapter = FakeAdapter()
+                original_chat = adapter.chat
+
+                def chat(*args, **kwargs):
+                    result = original_chat(*args, **kwargs)
+                    if (scenario == "disabled_reasoning"
+                            and kwargs.get("options", {}).get("disabled")):
+                        result.reasoning = "unexpected thought"
+                    if scenario == "content_leak" and result.reasoning:
+                        result.content = "<think>thought</think>391"
+                    # Use the real adapter to parse the alternate wire field.
+                    parsed = AdapterTest._openai_reasoning_response(
+                        {"reasoning_content": result.reasoning},
+                        kwargs["stream"],
+                    )
+                    result.reasoning = parsed.reasoning
+                    result.legacy_reasoning = parsed.legacy_reasoning
+                    return result
+
+                with mock.patch.object(adapter, "chat", side_effect=chat):
+                    with tempfile.TemporaryDirectory() as directory:
+                        code, text = self._run("json", directory, adapter)
+                report = json.loads(text)
+                if scenario == "valid":
+                    self.assertEqual(code, 0)
+                    response = report["checks"]["streaming_reasoning"]["response"]
+                    self.assertGreater(response["legacy_reasoning_length"], 0)
+                    self.assertEqual(response["reasoning_length"],
+                                     response["legacy_reasoning_length"])
+                else:
+                    self.assertEqual(code, 1)
+                    check = ("thinking_disabled"
+                             if scenario == "disabled_reasoning"
+                             else "streaming_reasoning")
+                    self.assertEqual(report["checks"][check]["status"], "failed")
 
     def test_human_verdict_lists_every_check_and_the_artifact(self):
         with tempfile.TemporaryDirectory() as directory:

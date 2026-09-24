@@ -27,6 +27,15 @@ The reasoning fixture allows enough output for models whose thought phase is
 longer than their answer. Results retain content excerpts and field lengths,
 not reasoning text.
 
+The OpenAI-compatible adapter accepts either `reasoning` or
+`reasoning_content` as the dedicated reasoning field, in complete responses
+and streaming deltas. It assembles each field before normalization; matching
+copies are counted once, while conflicting nonempty copies fail. Reasoning
+in either spelling must still be absent when thinking is disabled, and raw
+markers in visible content still fail. `reasoning_length` reports normalized
+text length; the existing `legacy_reasoning_length` retains the raw
+`reasoning_content` length for wire-format evidence.
+
 The OpenAI-compatible adapters explicitly use `tool_choice: auto` for both
 tool-call checks. This exercises the model's own tool syntax and the server's
 configured parser; a named choice can invoke guided decoding and bypass both.
@@ -248,6 +257,13 @@ model's own structured-output result.
 
 ## Amendments
 
+- **Reasoning field aliases accepted** (report shape unchanged,
+  `SCHEMA_VERSION` 4). The OpenAI adapter now normalizes `reasoning_content`
+  as well as `reasoning`; the former spelling alone no longer fails the
+  response. Fixtures, budgets, tool validation and reasoning separation are
+  unchanged. Earlier failures caused by the rejected field name, and tool
+  continuations skipped because of them, require a rerun; they are not
+  evidence of broken reasoning or tools. Other results remain comparable.
 - **Automatic tool parsing covered** (`SCHEMA_VERSION` 4). The tool-call
   fixture now uses automatic rather than named choice, and a second check runs
   it over streaming. Named choice could let guided decoding bypass the model's

@@ -392,6 +392,14 @@ def _ollama_tool_calls(message: dict) -> list[ToolCall]:
     return calls
 
 
+def _normalize_openai_reasoning(result: ChatResult) -> ChatResult:
+    if (result.reasoning and result.legacy_reasoning
+            and result.reasoning != result.legacy_reasoning):
+        raise RuntimeError("conflicting reasoning and reasoning_content fields")
+    result.reasoning = result.reasoning or result.legacy_reasoning
+    return result
+
+
 class OpenAIChatAdapter:
     def __init__(self, base_url: str, model: str, timeout: int):
         self.url = f"{base_url.rstrip('/')}/v1/chat/completions"
@@ -425,7 +433,7 @@ class OpenAIChatAdapter:
                 raise RuntimeError(f"expected one chat choice, found {len(choices)}")
             choice = choices[0]
             message = choice.get("message") or {}
-            return ChatResult(
+            return _normalize_openai_reasoning(ChatResult(
                 content=str(message.get("content") or ""),
                 reasoning=str(message.get("reasoning") or ""),
                 legacy_reasoning=str(message.get("reasoning_content") or ""),
@@ -433,7 +441,7 @@ class OpenAIChatAdapter:
                 chunks=1,
                 completed=True,
                 finish_reason=choice.get("finish_reason"),
-            )
+            ))
 
         request = urllib.request.Request(
             self.url,
@@ -504,7 +512,7 @@ class OpenAIChatAdapter:
                 ]
             }
         )
-        return result
+        return _normalize_openai_reasoning(result)
 
     @staticmethod
     def assistant_message(result: ChatResult) -> dict:
@@ -663,8 +671,6 @@ def _no_leak(content: str) -> None:
 def _require_completed(result: ChatResult) -> None:
     if not result.completed:
         raise RuntimeError("chat response did not complete")
-    if result.legacy_reasoning:
-        raise RuntimeError("reasoning arrived in legacy reasoning_content")
 
 
 def _require_tool_call(result: ChatResult) -> ToolCall:
