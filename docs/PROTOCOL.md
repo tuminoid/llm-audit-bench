@@ -209,7 +209,9 @@ gets to `llama-bench`'s empty context; `pp512` includes the first token's
 forward pass, as mlx-lm and HTTP-level measurements do. Neither figure
 enters sessions/hour, agreement, or publication; the step exists only to
 compare an engine or quantization change with published `llama-bench`
-figures.
+figures. A backend that cannot force an exact output length (Ollama has no
+`ignore_eos`, so a model may stop early) records the reference as
+unavailable, with the reason, and the run continues.
 
 ### Near-context capacity
 

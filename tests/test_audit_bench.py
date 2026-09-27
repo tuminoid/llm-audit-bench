@@ -824,8 +824,13 @@ class AuditBenchTest(unittest.TestCase):
                 return dataclasses.replace(result, output_tokens=90)
             return result
 
-        with self.assertRaisesRegex(RuntimeError, "reference call returned 90"):
-            self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""}, request=short)
+        _, text = self._run_fake_protocol(
+            {"AUDIT_BENCH_GATE_CMD": ""}, request=short
+        )
+        document = json.loads(text.splitlines()[-1])
+        self.assertIn("reference call returned 90",
+                      document["reference"]["unavailable"])
+        self.assertIn("audit_session", document)
 
     def test_json_document_is_retained_and_named_in_the_summary(self):
         output = io.StringIO()

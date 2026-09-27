@@ -1604,6 +1604,8 @@ def _measure_reference(
 
 
 def _reference_line(reference: dict) -> str:
+    if "unavailable" in reference:
+        return f"unavailable: {reference['unavailable']}"
     pp = reference["prompt_processing"]
     tg = reference["token_generation"]["tokens_per_second"]
     return (
@@ -2215,7 +2217,13 @@ def run_benchmark(
         return 0
 
     print("reference (llama-bench method):")
-    result["reference"] = _measure_reference(request, calibration, settings)
+    try:
+        result["reference"] = _measure_reference(request, calibration, settings)
+    except RuntimeError as exc:
+        # The reference feeds nothing, so a backend that cannot force an
+        # exact length (Ollama has no ignore_eos) loses only the reference.
+        result["reference"] = {"unavailable": str(exc)}
+        print(f"  {_reference_line(result['reference'])}")
     near_plan = plan["capacity_near"]
     print("near-context capacity:")
     result["capacity_near"] = _measure_capacity(
