@@ -646,8 +646,9 @@ def vllm_capacity(
             if matches:
                 slots = int(matches[-1])
         if pool is None:
+            # vLLM-Metal 0.30.0 labels its unified pool CPU.
             matches = re.findall(
-                r"GPU KV cache size:\s*([0-9,]+) tokens", text
+                r"(?:GPU|CPU) KV cache size:\s*([0-9,]+) tokens", text
             )
             if matches:
                 pool = int(matches[-1].replace(",", ""))

@@ -644,6 +644,27 @@ class AuditBenchTest(unittest.TestCase):
                     (8, 746553, "explicit or managed server log"),
                 )
 
+    def test_vllm_capacity_reads_metal_unified_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = pathlib.Path(directory) / "server.log"
+            log.write_text(
+                "host: 128 GiB unified memory -> util 0.71, seqs 5, batched 8192\n"
+                "CPU KV cache size: 2,775,642 tokens\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "AUDIT_BENCH_ACTIVE_SLOTS": "",
+                    "AUDIT_BENCH_KV_TOKENS": "",
+                },
+                clear=False,
+            ):
+                self.assertEqual(
+                    vllm_capacity(log, 262144, False),
+                    (5, 2775642, "explicit or managed server log"),
+                )
+
     def test_dry_run_capacity_is_conservative_without_log(self):
         with mock.patch.dict(
             os.environ,
