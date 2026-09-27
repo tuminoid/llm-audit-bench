@@ -25,10 +25,10 @@ itself has no dependencies. All tasks run through make:
 | Path | Contents |
 | -- | -- |
 | `src/audit_bench.py` | AuditBench v2 harness and the `audit-bench` CLI |
-| `src/capability_check.py` | Capability Check v1 harness and the `capability-check` CLI |
+| `src/capability_check.py` | Capability Check v2 harness and the `capability-check` CLI |
 | `tests/` | Unit tests (stdlib `unittest`) |
 | `docs/PROTOCOL.md` | Canonical AuditBench v2 protocol document |
-| `docs/CAPABILITY.md` | Canonical Capability Check v1 protocol document |
+| `docs/CAPABILITY.md` | Canonical Capability Check v2 protocol document |
 | `AGENTS.md` | The same rules, stated for AI coding agents |
 
 ## Hard invariants

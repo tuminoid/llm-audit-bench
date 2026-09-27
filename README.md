@@ -9,13 +9,16 @@ workloads. Two instruments, one target: any OpenAI-compatible endpoint.
   -- sessions/hour, and prefill and decode rates as the context grows --
   plus a model-driven conversation profile for usability. Spec:
   [docs/PROTOCOL.md](docs/PROTOCOL.md).
-- **Capability Check v1** (`capability-check`) is the pass/fail API
-  compatibility gate: streaming reasoning, thinking-disabled control, tool
-  calls in non-streaming and streaming modes, tool round trip, structured JSON
-  with a measured unaided document, and whether the server enforces a JSON
-  schema or admits it cannot. Spec: [docs/CAPABILITY.md](docs/CAPABILITY.md).
+- **Capability Check v2** (`capability-check`) is the pass/fail model gate:
+  streaming reasoning, thinking-disabled control, tool calls in
+  non-streaming and streaming modes, tool round trip, structured JSON with a
+  measured unaided document, whether the server enforces a JSON schema or
+  admits it cannot, and audit fitness: audit-shaped tasks at the declared
+  sampling, judged against ground truth. Spec:
+  [docs/CAPABILITY.md](docs/CAPABILITY.md).
 
-Neither scores answer quality. Benchmark rates and capability verdicts are
+AuditBench does not score answer quality, and audit fitness never ranks
+models: it passes or fails them. Benchmark rates and capability verdicts are
 different facts; keep them separate.
 
 ## What the endpoint must provide
@@ -36,7 +39,7 @@ per-request context, the checkpoint's sampling (`AUDIT_BENCH_SAMPLING`),
 and ideally the scheduler admission (`--active-slots`) and raw KV pool size
 (`--kv-tokens`). Without the capacity facts the harness assumes one slot and
 one context of KV and measures single-stream only; without sampling the
-result is not canonical.
+result is not canonical and Capability Check audit fitness fails.
 
 ## Install
 
@@ -70,9 +73,10 @@ uv run audit-bench --profile conversation \
 uv run audit-bench --base-url http://127.0.0.1:8000 \
   --context 131072 --dry-run
 
-# Compatibility gate; state the model's documented expectations
+# Model gate; state the model's documented expectations and sampling
 uv run capability-check --base-url http://127.0.0.1:8000 \
-  --model my-model --reasoning required --tools required
+  --model my-model --reasoning required --tools required \
+  --sampling "$AUDIT_BENCH_SAMPLING"
 ```
 
 ## Benchmark profiles
@@ -113,7 +117,8 @@ line names the file. `--format json` prints that same document on stdout
 instead, for tools that parse it.
 
 `capability-check` prints the same shape: a human verdict listing every
-check, its status, and any failure reason, with the retained JSON under
+check, its status, and any failure reason, plus one line per audit fitness
+task with its failure classes, with the retained JSON under
 `${XDG_STATE_HOME:-~/.local/state}/capability-check/` and `--format json`
 for tools.
 
