@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared AuditBench v1 protocol for local inference runtimes.
+"""Shared AuditBench v2 protocol for local inference runtimes.
 
 Runtime wrappers provide one request function. This module owns every workload
 shape and metric so runtime adapters cannot silently drift. It also runs
@@ -12,7 +12,6 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
-import math
 import os
 import pathlib
 import platform
@@ -28,25 +27,36 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
-PROTOCOL = "audit-v1"
-SCHEMA_VERSION = 6
-COMMON_PREFILL_TARGETS = (32768, 65536, 131072)
+PROTOCOL = "audit-v2"
+# Retained documents of the retired protocol stay listable; --show names
+# the last harness commit that renders them instead of guessing.
+LEGACY_PROTOCOL = "audit-v1"
+LEGACY_HARNESS_COMMIT = "382760d"
+SCHEMA_VERSION = 7
 DEFAULT_STREAMS = (1, 2, 4, 8)
-DEFAULT_DEEP_STREAMS = (1, 2, 4)
 DEFAULT_SAMPLES = 3
 DEFAULT_MIN_SAMPLES = 2
 DEFAULT_SAMPLE_AGREEMENT = 0.05
-DEFAULT_OUTPUT_TOKENS = 1024
-DEFAULT_DEEP_OUTPUT_TOKENS = 256
 DEFAULT_TOLERANCE = 0.02
 DEFAULT_CONV_EVIDENCE_TOKENS = 32768
 DEFAULT_CONV_TOOL_TOKENS = 8192
 DEFAULT_CONV_OUTPUT_TOKENS = 16384
-# Concurrent replay probe turns decode a realistic agent turn (analysis
-# plus a tool call) instead of the 32-token prefill probe; 1,024 is the
-# protocol's canonical normal output size, shared with decode and
-# audit_32k, so per-turn decode contention is part of the measurement.
-DEFAULT_CONV_TURN_TOKENS = 1024
+# Session turns are the model's natural agent turn (reasoning, a note, a
+# tool call); the cap only bounds a runaway. The report is the session's
+# deliverable, natural length under its own cap: reasoning plus a fix for
+# each of up to 16 findings, the same budget the conversation verdict has.
+SESSION_TURN_TOKENS = 2048
+SESSION_REPORT_TOKENS = 16384
+# Declared sampling keys and their types: the OpenAI-compatible request
+# fields the fleet's runtimes accept for a checkpoint's sampling defaults.
+SAMPLING_KEYS = {
+    "temperature": float,
+    "top_p": float,
+    "top_k": int,
+    "min_p": float,
+    "presence_penalty": float,
+    "repetition_penalty": float,
+}
 # Assistant notes are short and reasoning is never resent, so context
 # fit reserves only a note-sized slice per turn, not the output cap.
 CONV_NOTE_RESERVE = 256
@@ -74,24 +84,29 @@ CONV_SYSTEM = (
     "list of every FINDING line you collected, as plain text with no "
     "further tool calls."
 )
-# The replay profile scripts the assistant turns itself, so the probe
-# call only has to exercise prefill; its output is discarded. The note
-# plus tool-call JSON stays well under CONV_NOTE_RESERVE, keeping the
-# context-fit math shared with the interactive conversation honest.
-REPLAY_PROBE_TOKENS = 32
-REPLAY_NOTE = "Ledger updated; reading the next evidence file."
+# The session profile scripts the assistant turns itself; the model's
+# own turn is measured and discarded. The note plus tool-call JSON stays
+# well under CONV_NOTE_RESERVE, keeping the context-fit math shared with
+# the interactive conversation honest.
+SESSION_NOTE = "Ledger updated; reading the next evidence file."
+SESSION_REPORT_REQUEST = (
+    "The chain is complete. Write the audit report now, as plain text with "
+    "no tool calls: for each finding, the finding line, the likely impact, "
+    "and a concrete code fix."
+)
+# Reference figures use llama-bench's method so an optimization can be
+# compared with published numbers: pp512 and tg128, one stream, greedy,
+# fixed length, five repetitions reported as mean and sample deviation.
+# They describe the engine at shallow depth, never audit serving.
+REFERENCE_PROMPT_TOKENS = 512
+REFERENCE_OUTPUT_TOKENS = 128
+REFERENCE_REPS = 5
+REFERENCE_PROMPT = "Reply with the single word ok."
 PROMPT_VARIANT_RESERVE = 64
-DECODE_PROMPT_RESERVE = 256
 NEAR_CONTEXT_NUMERATOR = 15
 NEAR_CONTEXT_DENOMINATOR = 16
 DEEP_CONTEXT_NUMERATOR = 7
 DEEP_CONTEXT_DENOMINATOR = 8
-OUTPUT_CONTROL = (
-    "this response is deliberately truncated by the benchmark. Emit a "
-    "never-ending comma-separated sequence of positive integers. Continue for "
-    "at least 4096 tokens; never conclude, explain, summarize, or emit an "
-    "end-of-turn marker."
-)
 
 
 @dataclass(frozen=True)
@@ -205,6 +220,27 @@ def parse_streams(value: str) -> tuple[int, ...]:
     return streams
 
 
+def parse_sampling(value: str) -> dict:
+    """Parse declared sampling as space-separated key=value pairs."""
+    sampling: dict = {}
+    for item in value.split():
+        key, sep, raw = item.partition("=")
+        if not sep or key not in SAMPLING_KEYS:
+            raise ValueError(
+                f"AUDIT_BENCH_SAMPLING item {item!r} is not one of "
+                + ", ".join(f"{name}=N" for name in SAMPLING_KEYS)
+            )
+        if key in sampling:
+            raise ValueError(f"AUDIT_BENCH_SAMPLING repeats {key}")
+        try:
+            sampling[key] = SAMPLING_KEYS[key](raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"AUDIT_BENCH_SAMPLING {key} must be numeric, got {raw!r}"
+            ) from exc
+    return sampling
+
+
 def _positive_int(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default))
     try:
@@ -221,11 +257,8 @@ class Settings:
     """Environment-controlled protocol settings."""
 
     streams: tuple[int, ...]
-    deep_streams: tuple[int, ...]
     profile: str
     samples: int
-    output_tokens: int
-    deep_output_tokens: int
     tolerance: float
     dry_run: bool
     min_samples: int = DEFAULT_MIN_SAMPLES
@@ -233,8 +266,8 @@ class Settings:
     conv_evidence_tokens: int = DEFAULT_CONV_EVIDENCE_TOKENS
     conv_tool_tokens: int = DEFAULT_CONV_TOOL_TOKENS
     conv_output_tokens: int = DEFAULT_CONV_OUTPUT_TOKENS
-    conv_turn_tokens: int = DEFAULT_CONV_TURN_TOKENS
     conv_max_steps: int = DEFAULT_CONV_MAX_STEPS
+    sampling: dict = field(default_factory=dict)
     gate_cmd: str | None = None
     system_prompt: str | None = None
     reasoning_effort: str | None = None
@@ -242,14 +275,9 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        profile = os.environ.get("AUDIT_BENCH_PROFILE", "full")
-        if profile not in {
-            "full", "decode", "conversation", "replay", "replay-concurrent"
-        }:
-            raise ValueError(
-                "AUDIT_BENCH_PROFILE must be full, decode, conversation, "
-                "replay, or replay-concurrent"
-            )
+        profile = os.environ.get("AUDIT_BENCH_PROFILE", "session")
+        if profile not in {"session", "conversation"}:
+            raise ValueError("AUDIT_BENCH_PROFILE must be session or conversation")
         tolerance_raw = os.environ.get(
             "AUDIT_BENCH_TARGET_TOLERANCE", str(DEFAULT_TOLERANCE)
         )
@@ -297,9 +325,6 @@ class Settings:
         conv_output = _positive_int(
             "AUDIT_BENCH_CONV_OUTPUT_TOKENS", DEFAULT_CONV_OUTPUT_TOKENS
         )
-        conv_turn = _positive_int(
-            "AUDIT_BENCH_CONV_TURN_TOKENS", DEFAULT_CONV_TURN_TOKENS
-        )
         conv_max_steps = _positive_int(
             "AUDIT_BENCH_CONV_MAX_STEPS", DEFAULT_CONV_MAX_STEPS
         )
@@ -310,12 +335,6 @@ class Settings:
                     ",".join(str(value) for value in DEFAULT_STREAMS),
                 )
             ),
-            deep_streams=parse_streams(
-                os.environ.get(
-                    "AUDIT_BENCH_DEEP_STREAMS",
-                    ",".join(str(value) for value in DEFAULT_DEEP_STREAMS),
-                )
-            ),
             profile=profile,
             samples=samples,
             min_samples=min_samples,
@@ -323,23 +342,19 @@ class Settings:
             conv_evidence_tokens=conv_evidence,
             conv_tool_tokens=conv_tool,
             conv_output_tokens=conv_output,
-            conv_turn_tokens=conv_turn,
             conv_max_steps=conv_max_steps,
-            output_tokens=_positive_int(
-                "AUDIT_BENCH_OUTPUT_TOKENS", DEFAULT_OUTPUT_TOKENS
-            ),
-            deep_output_tokens=_positive_int(
-                "AUDIT_BENCH_DEEP_OUTPUT_TOKENS", DEFAULT_DEEP_OUTPUT_TOKENS
-            ),
+            # The checkpoint's own sampling, declared by the model config:
+            # live clients decode at it, so every generating call does.
+            sampling=parse_sampling(os.environ.get("AUDIT_BENCH_SAMPLING", "")),
             tolerance=tolerance,
             dry_run=os.environ.get("AUDIT_BENCH_DRY_RUN", "0") == "1",
             gate_cmd=os.environ.get("AUDIT_BENCH_GATE_CMD") or None,
-            # Model-documented reasoning-effort controls (docs/PROTOCOL.md
-            # "Model-documented decode-compliance controls"). The control may
-            # ride in the system role (system_prompt) or the runtime's
-            # documented parameter (reasoning_effort). Recorded configuration
-            # only; the workload text itself never changes, and neither marks
-            # the run non-canonical.
+            # Model-documented reasoning controls (docs/PROTOCOL.md
+            # "Model-documented controls"). The control may ride in the
+            # system role (system_prompt) or the runtime's documented
+            # parameter (reasoning_effort). Recorded configuration only; the
+            # workload text itself never changes, and neither marks the run
+            # non-canonical.
             system_prompt=os.environ.get("AUDIT_BENCH_SYSTEM_PROMPT") or None,
             reasoning_effort=os.environ.get("AUDIT_BENCH_REASONING_EFFORT")
             or None,
@@ -350,35 +365,28 @@ class Settings:
 
     @property
     def canonical(self) -> bool:
-        # Four fixed protocol workloads exist: the full cache-neutral phase
-        # set, the interactive audit conversation (model usability), the
-        # scripted audit replay (server performance), and the concurrent
-        # audit replay (multi-agent contention over a shared prefix). Each
-        # is canonical at its own defaults; decode remains a tuning aid.
+        # Two fixed workloads exist: the scripted agent session (serving
+        # performance) and the interactive audit conversation (model
+        # usability). Both decode at the declared sampling; a run at an
+        # undeclared server default measures an arbitrary sampler.
         return (
             self.streams == DEFAULT_STREAMS
-            and self.deep_streams == DEFAULT_DEEP_STREAMS
-            and self.profile in (
-                "full", "conversation", "replay", "replay-concurrent"
-            )
+            and self.profile in ("session", "conversation")
             and self.conv_evidence_tokens == DEFAULT_CONV_EVIDENCE_TOKENS
             and self.conv_tool_tokens == DEFAULT_CONV_TOOL_TOKENS
             and self.conv_output_tokens == DEFAULT_CONV_OUTPUT_TOKENS
-            and self.conv_turn_tokens == DEFAULT_CONV_TURN_TOKENS
             and self.conv_max_steps == DEFAULT_CONV_MAX_STEPS
             and self.samples == DEFAULT_SAMPLES
             and self.min_samples == DEFAULT_MIN_SAMPLES
             and self.sample_agreement == DEFAULT_SAMPLE_AGREEMENT
-            and self.output_tokens == DEFAULT_OUTPUT_TOKENS
-            and self.deep_output_tokens == DEFAULT_DEEP_OUTPUT_TOKENS
             and self.tolerance == DEFAULT_TOLERANCE
+            and "temperature" in self.sampling
             and not self.tolerate_off_by_one
         )
 
     def to_dict(self) -> dict:
         result = asdict(self)
         result["streams"] = list(self.streams)
-        result["deep_streams"] = list(self.deep_streams)
         return result
 
 
@@ -404,34 +412,32 @@ def _endpoints(streams: list[int]) -> list[int]:
     return [1] if streams[-1] == 1 else [1, streams[-1]]
 
 
-def _replay_concurrent_streams(
+def _session_streams(
     context: int,
     settings: Settings,
     active_slots: int,
     kv_pool_tokens: int,
 ) -> tuple[int, list[int]]:
-    """Fitting concurrent-replay stream counts and the per-stream demand.
+    """Session stream counts (1x and the largest fitting) and the demand.
 
-    Demand is the final resent conversation plus the verdict cap. No
-    shared-prefix credit is taken even though concurrent streams share
+    Demand is the final resent conversation plus the report cap. No
+    shared-prefix credit is taken even though concurrent sessions share
     their evidence prefix, so admission never depends on cache behavior.
-    A single replay always fits: the step fit keeps the final prompt
-    plus verdict output within one configured context, and the pool
+    A single session always fits: the step fit keeps the final prompt
+    plus the verdict cap within one configured context, and the pool
     holds at least one context.
     """
     steps = conversation_steps(context, settings)
     per_stream = (
         settings.conv_evidence_tokens
         + steps * (settings.conv_tool_tokens + CONV_NOTE_RESERVE)
-        + settings.conv_output_tokens
+        + SESSION_REPORT_TOKENS
     )
     max_streams = min(active_slots, kv_pool_tokens // per_stream)
     fitting = [
-        candidate
-        for candidate in settings.deep_streams
-        if candidate <= max_streams
+        candidate for candidate in settings.streams if candidate <= max_streams
     ]
-    return per_stream, fitting or [1]
+    return per_stream, _endpoints(fitting or [1])
 
 
 def build_plan(
@@ -451,30 +457,6 @@ def build_plan(
         )
 
     near_target = context * NEAR_CONTEXT_NUMERATOR // NEAR_CONTEXT_DENOMINATOR
-    decode_streams = _fitting_streams(
-        settings.streams,
-        active_slots,
-        kv_pool_tokens,
-        DECODE_PROMPT_RESERVE,
-        settings.output_tokens,
-    )
-    audit_32k_streams = _fitting_streams(
-        settings.streams,
-        active_slots,
-        kv_pool_tokens,
-        32768,
-        settings.output_tokens,
-    )
-    deep_target = context * DEEP_CONTEXT_NUMERATOR // DEEP_CONTEXT_DENOMINATOR
-    deep_streams = _endpoints(
-        _fitting_streams(
-            settings.deep_streams,
-            active_slots,
-            kv_pool_tokens,
-            deep_target,
-            settings.deep_output_tokens,
-        )
-    )
     capacity_streams = _endpoints(
         _fitting_streams(
             settings.streams,
@@ -484,101 +466,47 @@ def build_plan(
             1,
         )
     )
-    replay_demand, replay_concurrent_streams = _replay_concurrent_streams(
+    session_demand, session_streams = _session_streams(
         context, settings, active_slots, kv_pool_tokens
     )
-    prefill_targets = [
-        target
-        for target in COMMON_PREFILL_TARGETS
-        if target <= context * DEEP_CONTEXT_NUMERATOR // DEEP_CONTEXT_DENOMINATOR
-    ]
-
-    audit_phases = [
-        {
-            "name": "audit_32k",
-            "target_prompt_tokens": 32768,
-            "output_tokens": settings.output_tokens,
-            "streams": audit_32k_streams,
-            "purpose": "common cold audit request",
-        },
-        {
-            "name": "audit_half",
-            "target_prompt_tokens": context // 2,
-            "output_tokens": settings.output_tokens,
-            "streams": [1],
-            "purpose": "mid-context audit request",
-        },
-        {
-            "name": "audit_deep",
-            "target_prompt_tokens": deep_target,
-            "output_tokens": settings.deep_output_tokens,
-            "streams": deep_streams,
-            "purpose": "late audit request under KV pressure",
-        },
-    ]
-    for phase in audit_phases:
-        target = phase["target_prompt_tokens"]
-        output = phase["output_tokens"]
-        if math.ceil(target * (1 + settings.tolerance)) + output >= context:
-            raise ValueError(
-                f"{phase['name']} does not leave output headroom in {context:,} tokens"
-            )
-
+    steps = conversation_steps(context, settings)
     return {
         "profile": settings.profile,
         "configured_context": context,
         "active_slots": active_slots,
         "kv_pool_tokens": kv_pool_tokens,
         "preferred_256k_context": context >= 262144,
-        "prefill_targets": prefill_targets,
         "capacity_near": {
             "target_prompt_tokens": near_target,
             "output_tokens": 1,
             "samples": 1,
             "streams": capacity_streams,
         },
-        "decode": {
-            "prompt": "short control prompt",
-            "output_tokens": settings.output_tokens,
-            "streams": decode_streams,
+        "session": {
+            "evidence_tokens": settings.conv_evidence_tokens,
+            "tool_result_tokens": settings.conv_tool_tokens,
+            "turn_output_tokens": SESSION_TURN_TOKENS,
+            "report_output_tokens": SESSION_REPORT_TOKENS,
+            "steps": steps,
+            "per_stream_kv_demand": session_demand,
+            "streams": session_streams,
         },
-        "audit_phases": audit_phases,
         "conversation": {
             "evidence_tokens": settings.conv_evidence_tokens,
             "tool_result_tokens": settings.conv_tool_tokens,
             "output_tokens": settings.conv_output_tokens,
-            "steps": conversation_steps(context, settings),
+            "steps": steps,
             "streams": [1],
-        },
-        "replay": {
-            "evidence_tokens": settings.conv_evidence_tokens,
-            "tool_result_tokens": settings.conv_tool_tokens,
-            "probe_output_tokens": REPLAY_PROBE_TOKENS,
-            "verdict_output_tokens": settings.conv_output_tokens,
-            "steps": conversation_steps(context, settings),
-            "streams": [1],
-        },
-        "replay_concurrent": {
-            "evidence_tokens": settings.conv_evidence_tokens,
-            "tool_result_tokens": settings.conv_tool_tokens,
-            "turn_output_tokens": settings.conv_turn_tokens,
-            "verdict_output_tokens": settings.conv_output_tokens,
-            "steps": conversation_steps(context, settings),
-            "per_stream_kv_demand": replay_demand,
-            "streams": replay_concurrent_streams,
         },
     }
 
 
-def audit_prompt(
-    n_lines: int, variant: int, output_control: bool = True
-) -> str:
+def audit_prompt(n_lines: int, variant: int) -> str:
     """Generate deterministic, varied source and tool evidence.
 
-    The embedded BENCHMARK CONTROL line keeps single-shot phases decoding
-    to their fixed token counts. The conversation profile must NOT carry
-    it: models that obey the embedded never-conclude instruction inside
-    conversational evidence derail the tool loop (observed:
+    The corpus carries no instruction of any kind: v1 embedded a
+    never-conclude control to force output lengths, and models that obeyed
+    it inside conversational evidence derailed the tool loop (observed:
     qwen3-coder emitting endless integers mid-audit).
     """
     templates = (
@@ -600,13 +528,7 @@ def audit_prompt(
     for index in range(n_lines):
         lines.append(templates[index % len(templates)])
     lines.append("END SECURITY AUDIT EVIDENCE")
-    if output_control:
-        lines.append(f"BENCHMARK CONTROL: {OUTPUT_CONTROL}")
     return "\n".join(lines)
-
-
-def decode_prompt(variant: int) -> str:
-    return f"Benchmark stream {variant}: {OUTPUT_CONTROL}"
 
 
 @dataclass(frozen=True)
@@ -627,7 +549,7 @@ class Calibration:
 
 
 class OpenAIChatAdapter:
-    """OpenAI-compatible chat-completions adapter used by both vLLM runtimes."""
+    """OpenAI-compatible single-prompt adapter for the 1-token gates."""
 
     def __init__(
         self,
@@ -644,9 +566,8 @@ class OpenAIChatAdapter:
         self.system_prompt = system_prompt
 
     def __call__(self, prompt: str, max_tokens: int, seed: int) -> RequestResult:
-        # The decode-compliance control (docs/PROTOCOL.md) rides in the
-        # system role; the workload prompt stays byte-identical in the user
-        # role.
+        # The documented control (docs/PROTOCOL.md) rides in the system
+        # role; the workload prompt stays byte-identical in the user role.
         messages: list[dict] = []
         if self.system_prompt is not None:
             messages.append({"role": "system", "content": self.system_prompt})
@@ -891,36 +812,52 @@ def openai_chat_fn(
 ) -> Callable:
     """Build a chat callable against an OpenAI-compatible /v1 endpoint.
 
-    Used by the conversation profile, which needs multi-message requests
-    with tools -- the single-prompt RequestFn cannot express them.
+    Used by the session and conversation profiles, which need
+    multi-message requests with tools -- the single-prompt RequestFn
+    cannot express them. The harness passes the declared sampling on
+    every call. A streamed call returns the same body shape plus a
+    `timing` block: the first token separates prefill of the uncached
+    suffix from decode.
     """
     endpoint = base_url.rstrip("/") + "/chat/completions"
 
-    def chat(messages: list[dict], tools: list[dict], max_tokens: int) -> dict:
-        # The decode-compliance control (docs/PROTOCOL.md) rides in the
-        # system role as a separate message ahead of the workload's own
-        # system message, so the workload text stays byte-identical on
-        # every resent turn.
+    def chat(
+        messages: list[dict],
+        tools: list[dict],
+        max_tokens: int,
+        sampling: dict | None = None,
+        stream: bool = False,
+    ) -> dict:
+        # The documented control (docs/PROTOCOL.md) rides in the system
+        # role as a separate message ahead of the workload's own system
+        # message, so the workload text stays byte-identical on every
+        # resent turn.
         if system_prompt is not None:
             messages = [{"role": "system", "content": system_prompt}] + messages
         payload: dict = {
             "model": model,
             "messages": messages,
             "tools": tools,
-            "temperature": 0,
             "max_tokens": max_tokens,
+            **(sampling or {}),
         }
         if reasoning_effort is not None:
             payload["reasoning_effort"] = reasoning_effort
+        if stream:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
         request = urllib.request.Request(
             endpoint,
             data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}
         )
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(
                 request, timeout=timeout
             ) as response:
+                if stream:
+                    return _read_stream(response, endpoint, started)
                 body = json.loads(response.read())
         except urllib.error.HTTPError as exc:
             message = exc.read().decode(errors="replace")
@@ -943,6 +880,72 @@ def openai_chat_fn(
         return body
 
     return chat
+
+
+def _read_stream(response, endpoint: str, started: float) -> dict:
+    """Assemble a server-sent chat stream into a body with timing.
+
+    The first token is the first chunk whose delta carries anything but
+    the role: content, a reasoning field under any runtime's name, or a
+    tool call. Token counts come only from the server's final usage
+    chunk; a stream without one is an error, never an estimate.
+    """
+    first_token = None
+    finish_reason = None
+    usage = None
+    content: list[str] = []
+    # Reasoning is measured, never kept: runtimes name the field
+    # reasoning or reasoning_content, and some send both copies.
+    reasoning = {"reasoning": 0, "reasoning_content": 0}
+    tool_calls: set[int] = set()
+    for raw in response:
+        line = raw.decode(errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{endpoint} sent a malformed stream line: {data[:200]}"
+            ) from exc
+        if chunk.get("error") is not None:
+            raise RuntimeError(
+                f"{endpoint} stream error: {str(chunk['error'])[:200]}"
+            )
+        if chunk.get("usage"):
+            usage = chunk["usage"]
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            if first_token is None and any(
+                value for key, value in delta.items() if key != "role"
+            ):
+                first_token = time.monotonic() - started
+            content.append(delta.get("content") or "")
+            for field in reasoning:
+                reasoning[field] += len(delta.get(field) or "")
+            tool_calls.update(
+                call.get("index", 0) for call in delta.get("tool_calls") or []
+            )
+            finish_reason = choice.get("finish_reason") or finish_reason
+    total = time.monotonic() - started
+    if usage is None:
+        raise RuntimeError(
+            f"{endpoint} stream ended without a usage chunk "
+            "(stream_options.include_usage unsupported?)"
+        )
+    return {
+        "choices": [{
+            "finish_reason": finish_reason,
+            "message": {"content": "".join(content)},
+        }],
+        "usage": usage,
+        "timing": {"first_token_seconds": first_token, "total_seconds": total},
+        "reasoning_chars": max(reasoning.values()),
+        "tool_calls": len(tool_calls),
+    }
 
 
 def conversation_steps(context: int, settings: Settings) -> int:
@@ -978,21 +981,20 @@ def _conversation_fixture(
     variant: int,
     chain_variant: int | None = None,
 ) -> tuple[int, str, dict, dict]:
-    """Deterministic evidence corpus shared by conversation and replay.
+    """Deterministic evidence corpus shared by conversation and session.
 
     Returns (steps, evidence, findings, files). Samples differ from the
     first token via the variant, so only self-sharing within one
-    conversation can hit a cache. The concurrent replay passes a
-    per-stream chain_variant with a shared evidence variant: streams
-    then present the identical evidence prefix (concurrent agents on
-    the same repository) while their file chains diverge from the first
-    tool result.
+    conversation can hit a cache. Concurrent sessions pass a per-stream
+    chain_variant with a shared evidence variant: streams then present
+    the identical evidence prefix (concurrent agents on the same
+    repository) while their file chains diverge from the first tool
+    result.
     """
     chain = variant if chain_variant is None else chain_variant
     steps = conversation_steps(context, settings)
     evidence = audit_prompt(
-        calibration.lines_for(settings.conv_evidence_tokens), variant,
-        output_control=False,
+        calibration.lines_for(settings.conv_evidence_tokens), variant
     )
     tool_lines = calibration.lines_for(settings.conv_tool_tokens)
 
@@ -1008,7 +1010,7 @@ def _conversation_fixture(
     files = {
         name: (
             f"TOOL RESULT {name}\n"
-            + audit_prompt(tool_lines, chain + n, output_control=False)
+            + audit_prompt(tool_lines, chain + n)
             + f"\nFINDING: {findings[name]}"
             + _chain_note(n)
         )
@@ -1039,7 +1041,7 @@ def _run_conversation(
     This is the model-usability half of the audit pair: the model itself
     must drive the tool loop and stop with a verdict, so non-compliance
     here means the model deviated from the fixture protocol -- it says
-    nothing about server performance, which the replay profile measures
+    nothing about server performance, which the session profile measures
     without depending on the model's cooperation. Mirrors the production
     secaudit client: every turn resends the whole conversation, the
     harness answers every tool call the model makes (one or several per
@@ -1059,7 +1061,10 @@ def _run_conversation(
     started = time.monotonic()
     for turn in range(max_turns):
         turn_started = time.monotonic()
-        response = chat(messages, CONV_TOOLS, settings.conv_output_tokens)
+        response = chat(
+            messages, CONV_TOOLS, settings.conv_output_tokens,
+            sampling=settings.sampling,
+        )
         wall = time.monotonic() - turn_started
         choice = response["choices"][0]
         message = choice["message"]
@@ -1187,62 +1192,86 @@ def _measure_conversations(
     return result
 
 
-def _replay_once(
+def _session_call(
+    chat: Callable, messages: list[dict], max_tokens: int, settings: Settings
+) -> dict:
+    """One streamed session call: server counts, prefill and decode split."""
+    response = chat(
+        messages, CONV_TOOLS, max_tokens,
+        sampling=settings.sampling, stream=True,
+    )
+    usage = response.get("usage") or {}
+    timing = response["timing"]
+    prompt = int(usage.get("prompt_tokens") or 0)
+    if prompt <= 0 or usage.get("completion_tokens") is None:
+        raise RuntimeError(f"server usage lacks token counts: {usage}")
+    cached = _cached_tokens(usage)
+    completion = int(usage["completion_tokens"])
+    first = timing["first_token_seconds"]
+    total = timing["total_seconds"]
+    if first is None:
+        if completion > 1:
+            raise RuntimeError(
+                f"server reported {completion} completion tokens but "
+                "streamed no delta; the call cannot be timed"
+            )
+        # An end-of-turn-only answer streams nothing: all of it is prefill.
+        first = total
+    decode_seconds = total - first
+    return {
+        "prompt_tokens": prompt,
+        "cached_tokens": cached,
+        "completion_tokens": completion,
+        "finish_reason": response["choices"][0].get("finish_reason"),
+        "wall_seconds": total,
+        "first_token_seconds": first,
+        # The first token closes prefill; the rest is decode.
+        "decode_tokens_per_second": (
+            (completion - 1) / decode_seconds
+            if completion > 1 and decode_seconds else None
+        ),
+        "content_chars": len(
+            response["choices"][0]["message"].get("content") or ""
+        ),
+        "reasoning_chars": response["reasoning_chars"],
+        "tool_calls": response["tool_calls"],
+        # Popped by the caller: only the report's text is judged.
+        "content": response["choices"][0]["message"].get("content") or "",
+    }
+
+
+def _session_once(
     chat: Callable,
     calibration: "Calibration",
     context: int,
     settings: Settings,
     evidence_variant: int,
     chain_variant: int,
-    probe_tokens: int,
-    probe_control: bool,
 ) -> dict:
-    """One scripted audit conversation: the harness drives every turn.
+    """One scripted agent session: the harness drives the transcript.
 
-    This is the server-performance half of the audit pair. The prefix
-    grows exactly as in the interactive conversation, but each assistant
-    turn is replaced by a scripted note and tool call, so every model on
-    every runtime produces the identical resend-everything shape -- a
-    model that cannot hold the interactive protocol still yields prefill
-    and cache numbers. The model is still called once per turn (that call
-    is the measurement); its probe output is capped and discarded, never
-    appended. With probe_control the measured call carries an ephemeral
-    decode-control user message so the model decodes a realistic agent
-    turn to the cap; the control never enters the transcript, keeping
-    the resent prefix byte-identical across models and runtimes. The
-    final verdict turn forces a full-cap decode at depth via the
-    standard output control, so its wall time is the end-to-end cost of
-    producing a verdict on this server.
+    The prefix grows exactly as in the interactive conversation, but each
+    assistant turn is replaced by a scripted note and tool call, so every
+    model on every runtime resends the identical transcript and a model
+    that cannot hold the protocol still yields numbers. Each call lets
+    the model write its natural turn under the declared sampling; that
+    output is measured and discarded. The final call asks for the report,
+    the session's deliverable, at its natural length.
     """
-    steps, evidence, _, files = _conversation_fixture(
+    steps, evidence, findings, files = _conversation_fixture(
         calibration, context, settings, evidence_variant, chain_variant
     )
     messages = _opening_messages(steps, evidence)
-    control_message = {
-        "role": "user",
-        "content": f"BENCHMARK CONTROL: {OUTPUT_CONTROL}",
-    }
     per_step = []
     started = time.monotonic()
     for turn, name in enumerate(files):
-        probe_messages = (
-            messages + [control_message] if probe_control else messages
-        )
-        turn_started = time.monotonic()
-        response = chat(probe_messages, CONV_TOOLS, probe_tokens)
-        wall = time.monotonic() - turn_started
-        usage = response.get("usage") or {}
-        per_step.append({
-            "step": turn + 1,
-            "wall_seconds": wall,
-            "prompt_tokens": usage.get("prompt_tokens"),
-            "cached_tokens": _cached_tokens(usage),
-            "completion_tokens": usage.get("completion_tokens"),
-        })
+        row = _session_call(chat, messages, SESSION_TURN_TOKENS, settings)
+        del row["content"]
+        per_step.append({"step": turn + 1, **row})
         call_id = f"call_{turn + 1:03d}"
         messages.append({
             "role": "assistant",
-            "content": REPLAY_NOTE,
+            "content": SESSION_NOTE,
             "tool_calls": [{
                 "id": call_id,
                 "type": "function",
@@ -1255,38 +1284,54 @@ def _replay_once(
         messages.append(
             {"role": "tool", "tool_call_id": call_id, "content": files[name]}
         )
-    messages.append(
-        {"role": "user", "content": f"BENCHMARK CONTROL: {OUTPUT_CONTROL}"}
-    )
-    verdict_started = time.monotonic()
-    response = chat(messages, CONV_TOOLS, settings.conv_output_tokens)
-    verdict_wall = time.monotonic() - verdict_started
+    messages.append({"role": "user", "content": SESSION_REPORT_REQUEST})
+    report = _session_call(chat, messages, SESSION_REPORT_TOKENS, settings)
+    report_text = report.pop("content")
+    recalled = sum(token in report_text for token in findings.values())
     total = time.monotonic() - started
-    choice = response["choices"][0]
-    usage = response.get("usage") or {}
-    verdict_completion = usage.get("completion_tokens") or 0
-    prompt_total = sum(row["prompt_tokens"] or 0 for row in per_step)
-    prompt_total += usage.get("prompt_tokens") or 0
-    cached_rows = [row["cached_tokens"] for row in per_step
+    calls = per_step + [report]
+    uncached = sum(
+        row["prompt_tokens"] - (row["cached_tokens"] or 0) for row in calls
+    )
+    prefill_seconds = sum(row["first_token_seconds"] for row in calls)
+    # Without the server's cached counts the uncached work is unknown; a
+    # full-prompt guess would overstate a warm server's prefill rate.
+    cache_reported = all(row["cached_tokens"] is not None for row in calls)
+    prompt_total = sum(row["prompt_tokens"] for row in calls)
+    cached_rows = [row["cached_tokens"] for row in calls
                    if row["cached_tokens"] is not None]
-    verdict_cached = _cached_tokens(usage)
-    if verdict_cached is not None:
-        cached_rows.append(verdict_cached)
-    row = {
+    return {
         "steps": steps,
         "wall_seconds": total,
-        "replays_per_hour": 3600 / total if total else 0,
-        "first_turn_wall_seconds": per_step[0]["wall_seconds"],
-        "final_turn_wall_seconds": per_step[-1]["wall_seconds"],
-        "verdict_wall_seconds": verdict_wall,
-        "verdict_prompt_tokens": usage.get("prompt_tokens"),
-        # A model that ignores the output control decodes fewer verdict
-        # tokens; the recorded completion count keeps rates comparable.
-        "verdict_completion_tokens": verdict_completion,
-        "verdict_finish_reason": choice.get("finish_reason"),
-        "verdict_output_tokens_per_second": (
-            verdict_completion / verdict_wall if verdict_wall else 0
+        "output_tokens": sum(row["completion_tokens"] for row in calls),
+        "prefill_tokens_per_second": (
+            uncached / prefill_seconds
+            if cache_reported and prefill_seconds else None
         ),
+        # Decode at the start, middle and end of the growing context.
+        "turn_decode_tokens_per_second": {
+            "first": per_step[0]["decode_tokens_per_second"],
+            "middle": per_step[len(per_step) // 2]["decode_tokens_per_second"],
+            "last": per_step[-1]["decode_tokens_per_second"],
+        },
+        "report": report,
+        # Recorded, never padded or retried. The report is the session's
+        # deliverable: it is complete when it ends on its own and names
+        # every finding the chain carried. An incomplete session is work a
+        # live audit would have to redo, so its run is not publishable.
+        "report_findings_recalled": recalled,
+        "complete": report["finish_reason"] != "length" and recalled == steps,
+        # A turn that hit its cap is bounded, not failed: long thinking and
+        # a runaway both end there, and the count is the evidence.
+        "truncated_calls": sum(row["finish_reason"] == "length" for row in calls),
+        "empty_turns": sum(
+            row["finish_reason"] != "length" and not row["content_chars"]
+            and not row["tool_calls"]
+            for row in per_step
+        ),
+        # Evidence for reasoning models only; the benchmark has no
+        # expectation to judge it against.
+        "unreasoned_calls": sum(not row["reasoning_chars"] for row in calls),
         "prompt_tokens_total": prompt_total,
         "cached_tokens_total": sum(cached_rows) if cached_rows else None,
         "cached_fraction": (
@@ -1295,45 +1340,14 @@ def _replay_once(
         ),
         "per_step": per_step,
     }
-    return row
 
 
-def _run_replay(
-    chat: Callable,
-    calibration: "Calibration",
-    context: int,
-    settings: Settings,
-    sample_index: int,
-) -> dict:
-    """One 1x replay sample: prefill-probe turns, gated and reported."""
-    _wait_for_gate(settings.gate_cmd)
-    variant = 800000 + sample_index * 1000
-    row = _replay_once(
-        chat,
-        calibration,
-        context,
-        settings,
-        evidence_variant=variant,
-        chain_variant=variant,
-        probe_tokens=REPLAY_PROBE_TOKENS,
-        probe_control=False,
-    )
-    row["sample"] = sample_index + 1
-    cached = row["cached_fraction"]
-    print(
-        f"  replay           sample={sample_index + 1} "
-        f"steps={row['steps']} "
-        f"wall={row['wall_seconds']:.1f}s "
-        f"first-turn={row['first_turn_wall_seconds']:.1f}s "
-        f"final-turn={row['final_turn_wall_seconds']:.1f}s "
-        f"verdict={row['verdict_completion_tokens']:,}tok/"
-        f"{row['verdict_wall_seconds']:.1f}s "
-        f"cached={cached if cached is None else round(cached, 3)}"
-    )
-    return row
+def _median_known(values: list) -> float | None:
+    known = [value for value in values if value is not None]
+    return statistics.median(known) if known else None
 
 
-def _run_replay_concurrent(
+def _run_session_batch(
     chat: Callable,
     calibration: "Calibration",
     context: int,
@@ -1341,18 +1355,15 @@ def _run_replay_concurrent(
     streams: int,
     sample_index: int,
 ) -> dict:
-    """One concurrent batch: N scripted replays over a shared prefix.
+    """One batch: N sessions over a shared evidence prefix.
 
     All streams carry the sample's evidence variant -- the same
     repository context concurrent agents would present -- while each
     stream's file chain diverges from its first tool result. Streams
-    start together on a barrier and then free-run their own turn loops;
-    no per-turn synchronization exists, so natural desync develops
-    exactly as independent agents drift apart. Probe turns decode a
-    realistic agent turn under an ephemeral control, so per-turn decode
-    contention is part of the measurement. Across samples and stream
-    counts the evidence changes from the first token, keeping every
-    batch cold at start.
+    start together on a barrier and then free-run their own turn loops,
+    so natural desync develops exactly as independent agents drift
+    apart. Across samples and stream counts the evidence changes from
+    the first token, keeping every batch cold at start.
     """
     _wait_for_gate(settings.gate_cmd)
     evidence_variant = 900000 + sample_index * 100000 + streams * 10000
@@ -1360,95 +1371,101 @@ def _run_replay_concurrent(
 
     def worker(stream_index: int) -> dict:
         barrier.wait()
-        return _replay_once(
+        return _session_once(
             chat,
             calibration,
             context,
             settings,
             evidence_variant=evidence_variant,
             chain_variant=evidence_variant + (stream_index + 1) * 1000,
-            probe_tokens=settings.conv_turn_tokens,
-            probe_control=True,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=streams
-    ) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=streams) as executor:
         futures = [executor.submit(worker, index) for index in range(streams)]
         started = time.monotonic()
         barrier.wait()
         stream_rows = [future.result() for future in futures]
     wall = time.monotonic() - started
 
-    first_turn_cached = [
-        row["per_step"][0]["cached_tokens"] for row in stream_rows
-    ]
-    cached_known = [value for value in first_turn_cached if value is not None]
-    fractions = [
-        row["cached_fraction"]
-        for row in stream_rows
-        if row["cached_fraction"] is not None
-    ]
-    turn_completions = [
-        step["completion_tokens"] or 0
-        for row in stream_rows
-        for step in row["per_step"]
-    ]
     row = {
         "sample": sample_index + 1,
         "streams": streams,
         "steps": stream_rows[0]["steps"],
         "wall_seconds": wall,
-        "replays_per_hour": streams * 3600 / wall if wall else 0,
-        "first_turn_wall_seconds": statistics.median(
-            [item["first_turn_wall_seconds"] for item in stream_rows]
+        "sessions_per_hour": streams * 3600 / wall if wall else 0,
+        "output_tokens_per_session": statistics.median(
+            [item["output_tokens"] for item in stream_rows]
         ),
-        "final_turn_wall_seconds": statistics.median(
-            [item["final_turn_wall_seconds"] for item in stream_rows]
+        "prefill_tokens_per_second": _median_known(
+            [item["prefill_tokens_per_second"] for item in stream_rows]
         ),
-        "verdict_output_tokens_per_second": statistics.median(
-            [item["verdict_output_tokens_per_second"] for item in stream_rows]
+        "report_decode_tokens_per_second": _median_known(
+            [item["report"]["decode_tokens_per_second"] for item in stream_rows]
         ),
-        "turn_completion_tokens_median": statistics.median(turn_completions),
-        # Whichever stream commits the shared evidence first seeds the
-        # cache for the rest; the per-stream list keeps that asymmetry
-        # visible instead of averaging it away.
-        "first_turn_cached_tokens": first_turn_cached,
-        "first_turn_cached_tokens_median": (
-            statistics.median(cached_known) if cached_known else None
+        "turn_decode_tokens_per_second": {
+            position: _median_known([
+                item["turn_decode_tokens_per_second"][position]
+                for item in stream_rows
+            ])
+            for position in ("first", "middle", "last")
+        },
+        "sessions_incomplete": sum(
+            not item["complete"] for item in stream_rows
         ),
-        "cached_fraction": (
-            statistics.median(fractions) if fractions else None
+        "truncated_calls": sum(item["truncated_calls"] for item in stream_rows),
+        "empty_turns": sum(item["empty_turns"] for item in stream_rows),
+        "unreasoned_calls": sum(
+            item["unreasoned_calls"] for item in stream_rows
+        ),
+        "cached_fraction": _median_known(
+            [item["cached_fraction"] for item in stream_rows]
         ),
         "per_stream": stream_rows,
     }
-    cached = row["cached_fraction"]
     print(
-        f"  replay_conc      n={streams:<2} sample={sample_index + 1} "
-        f"wall={wall:.1f}s replays={row['replays_per_hour']:.2f}/h "
-        f"first-turn={row['first_turn_wall_seconds']:.1f}s "
-        f"final-turn={row['final_turn_wall_seconds']:.1f}s "
-        f"turn-decode={row['turn_completion_tokens_median']:.0f}tok "
-        f"cached={cached if cached is None else round(cached, 3)}"
+        f"  session          n={streams:<2} sample={sample_index + 1} "
+        f"wall={wall:.1f}s sessions={row['sessions_per_hour']:.2f}/h "
+        f"output={row['output_tokens_per_session']:,.0f}tok "
+        f"prefill={_rate(row['prefill_tokens_per_second'])} "
+        f"report-decode={_rate(row['report_decode_tokens_per_second'])} "
+        f"cached={_cached(row['cached_fraction'])}"
     )
     return row
 
 
-def _measure_replay_concurrent(
+def _rate(value: float | None) -> str:
+    return "-" if value is None else f"{value:,.1f}"
+
+
+def _rates_agree(rows: list[dict], agreement: float) -> bool:
+    """True when the prefill and report decode rates lie within the spread.
+
+    Natural output lengths vary under sampling, so wall time is not a
+    stable criterion; the server's rates are. A rate a sample could not
+    measure is left out of the comparison.
+    """
+    for key in ("prefill_tokens_per_second", "report_decode_tokens_per_second"):
+        values = [row[key] for row in rows if row[key] is not None]
+        if len(values) > 1 and max(values) - min(values) > min(values) * agreement:
+            return False
+    return True
+
+
+def _measure_sessions(
     chat: Callable,
     calibration: "Calibration",
     context: int,
     settings: Settings,
     streams: tuple[int, ...],
 ) -> dict:
-    """Concurrent replay family over the fitting stream counts."""
+    """Session family over the planned stream counts."""
     rows: dict[int, list[dict]] = {count: [] for count in streams}
 
     def _run_pass(sample_index: int) -> None:
         order = streams if sample_index % 2 == 0 else tuple(reversed(streams))
         for stream_count in order:
             rows[stream_count].append(
-                _run_replay_concurrent(
+                _run_session_batch(
                     chat, calibration, context, settings,
                     stream_count, sample_index,
                 )
@@ -1460,11 +1477,11 @@ def _measure_replay_concurrent(
     # A full extra pass keeps the alternating stream order symmetric, so
     # a single disagreeing stream count extends every count.
     while passes < settings.samples and any(
-        not _samples_agree(rows[count], settings.sample_agreement)
+        not _rates_agree(rows[count], settings.sample_agreement)
         for count in streams
     ):
         print(
-            f"  replay_conc      samples disagree beyond "
+            f"  session          samples disagree beyond "
             f"{settings.sample_agreement:.0%}; extending"
         )
         _run_pass(passes)
@@ -1473,94 +1490,126 @@ def _measure_replay_concurrent(
     results = {}
     for stream_count in streams:
         batch = rows[stream_count]
-        fractions = [
-            row["cached_fraction"]
-            for row in batch
-            if row["cached_fraction"] is not None
-        ]
         results[str(stream_count)] = {
             "streams": stream_count,
             "samples": batch,
             "wall_seconds": _median_range(batch, "wall_seconds"),
-            "replays_per_hour": _median_range(batch, "replays_per_hour"),
-            "first_turn_wall_seconds": _median_range(
-                batch, "first_turn_wall_seconds"
+            "sessions_per_hour": _median_range(batch, "sessions_per_hour"),
+            "output_tokens_per_session": statistics.median(
+                [row["output_tokens_per_session"] for row in batch]
             ),
-            "final_turn_wall_seconds": _median_range(
-                batch, "final_turn_wall_seconds"
+            "prefill_tokens_per_second": _median_known(
+                [row["prefill_tokens_per_second"] for row in batch]
             ),
-            "verdict_output_tokens_per_second": _median_range(
-                batch, "verdict_output_tokens_per_second"
+            "report_decode_tokens_per_second": _median_known(
+                [row["report_decode_tokens_per_second"] for row in batch]
             ),
-            "turn_completion_tokens_median": statistics.median(
-                [row["turn_completion_tokens_median"] for row in batch]
-            ),
-            "cached_fraction_median": (
-                statistics.median(fractions) if fractions else None
+            "turn_decode_tokens_per_second": {
+                position: _median_known([
+                    row["turn_decode_tokens_per_second"][position]
+                    for row in batch
+                ])
+                for position in ("first", "middle", "last")
+            },
+            "sessions": sum(row["streams"] for row in batch),
+            **{
+                key: sum(row[key] for row in batch)
+                for key in ("sessions_incomplete", "truncated_calls",
+                            "empty_turns", "unreasoned_calls")
+            },
+            "cached_fraction_median": _median_known(
+                [row["cached_fraction"] for row in batch]
             ),
         }
-    one = results["1"]["replays_per_hour"]["median"]
-    scaling = {
-        stream_count: (
-            result["replays_per_hour"]["median"] / one if one else 0
-        )
-        for stream_count, result in results.items()
-    }
-    peak_streams, peak = max(
-        results.items(),
-        key=lambda item: item[1]["replays_per_hour"]["median"],
-    )
+    one = results["1"]["sessions_per_hour"]["median"]
     return {
         "steps": conversation_steps(context, settings),
         "by_streams": results,
-        "scaling_vs_1x": scaling,
-        "peak_streams": int(peak_streams),
-        "peak_replays_per_hour": peak["replays_per_hour"]["median"],
+        "scaling_vs_1x": {
+            stream_count: (
+                result["sessions_per_hour"]["median"] / one if one else 0
+            )
+            for stream_count, result in results.items()
+        },
     }
 
 
-def _measure_replays(
-    chat: Callable,
-    calibration: "Calibration",
-    context: int,
-    settings: Settings,
+def _mean_sd(values: list[float]) -> dict:
+    return {
+        "mean": statistics.mean(values),
+        "sd": statistics.stdev(values) if len(values) > 1 else 0.0,
+        "reps": values,
+    }
+
+
+def _measure_reference(
+    request: RequestFn, calibration: "Calibration", settings: Settings
 ) -> dict:
-    rows = [
-        _run_replay(chat, calibration, context, settings, index)
-        for index in range(min(settings.min_samples, settings.samples))
-    ]
-    while (
-        len(rows) < settings.samples
-        and not _samples_agree(rows, settings.sample_agreement)
-    ):
-        print(
-            f"  replay           samples disagree beyond "
-            f"{settings.sample_agreement:.0%}; extending"
-        )
-        rows.append(
-            _run_replay(chat, calibration, context, settings, len(rows))
-        )
-    result = {
-        "steps": conversation_steps(context, settings),
-        "samples": rows,
-        "wall_seconds": _median_range(rows, "wall_seconds"),
-        "replays_per_hour": _median_range(rows, "replays_per_hour"),
-        "first_turn_wall_seconds": _median_range(
-            rows, "first_turn_wall_seconds"
-        ),
-        "final_turn_wall_seconds": _median_range(
-            rows, "final_turn_wall_seconds"
-        ),
-        "verdict_output_tokens_per_second": _median_range(
-            rows, "verdict_output_tokens_per_second"
-        ),
+    """llama-bench pp512 and tg128 over the fixed-length request contract.
+
+    pp: a cold prompt of about 512 tokens (calibration moves in whole
+    evidence lines, so the actual count is recorded) with one output token;
+    the rate is prompt tokens over request seconds, a lower bound that
+    includes HTTP and templating. tg: the same minimal prompt for 128
+    tokens and for one; the difference is 127 decode steps, so the rate is
+    llama-server's and vLLM's (N-1) over decode time, with prefill and
+    request overhead cancelled. Every call must return its exact length.
+    """
+    def exact(result: RequestResult, tokens: int) -> RequestResult:
+        if not _output_matches(result, tokens, settings.tolerate_off_by_one):
+            raise RuntimeError(
+                f"reference call returned {result.output_tokens} tokens, "
+                f"expected {tokens} (backends must honor max_tokens exactly)"
+            )
+        return result
+
+    lines = calibration.lines_for(REFERENCE_PROMPT_TOKENS)
+    pp_prompts, pp_rates, tg_prompts, tg_rates = [], [], [], []
+    for rep in range(REFERENCE_REPS):
+        seed = 800000 + rep
+        # The variant leads the prompt, so no rep reuses a cached prefix.
+        pp = exact(request(audit_prompt(lines, seed), 1, seed), 1)
+        pp_prompts.append(pp.prompt_tokens)
+        pp_rates.append(pp.prompt_tokens / pp.seconds)
+        prompt = f"{seed} {REFERENCE_PROMPT}"
+        full = exact(request(prompt, REFERENCE_OUTPUT_TOKENS, seed),
+                     REFERENCE_OUTPUT_TOKENS)
+        one = exact(request(prompt, 1, seed), 1)
+        decode = full.seconds - one.seconds
+        if decode <= 0:
+            raise RuntimeError(
+                f"{REFERENCE_OUTPUT_TOKENS}-token call was not slower than "
+                "the 1-token call; decode time cannot be measured"
+            )
+        tg_prompts.append(full.prompt_tokens)
+        tg_rates.append((REFERENCE_OUTPUT_TOKENS - 1) / decode)
+    reference = {
+        "method": "llama-bench pp512/tg128 equivalent; not a serving result",
+        "prompt_processing": {
+            "target_prompt_tokens": REFERENCE_PROMPT_TOKENS,
+            "prompt_tokens": pp_prompts,
+            "tokens_per_second": _mean_sd(pp_rates),
+        },
+        "token_generation": {
+            "output_tokens": REFERENCE_OUTPUT_TOKENS,
+            "prompt_tokens": tg_prompts,
+            "tokens_per_second": _mean_sd(tg_rates),
+        },
     }
-    fractions = [row["cached_fraction"] for row in rows
-                 if row["cached_fraction"] is not None]
-    result["cached_fraction_median"] = (
-        statistics.median(fractions) if fractions else None
+    print(f"  {_reference_line(reference)}")
+    return reference
+
+
+def _reference_line(reference: dict) -> str:
+    pp = reference["prompt_processing"]
+    tg = reference["token_generation"]["tokens_per_second"]
+    return (
+        f"pp{REFERENCE_PROMPT_TOKENS} {pp['tokens_per_second']['mean']:,.1f}"
+        f" +/- {pp['tokens_per_second']['sd']:,.1f} tok/s "
+        f"(actual {statistics.median(pp['prompt_tokens']):,.0f} tokens), "
+        f"tg{REFERENCE_OUTPUT_TOKENS} {tg['mean']:,.1f} +/- {tg['sd']:,.1f} "
+        "tok/s"
     )
-    return result
 
 
 def _wait_for_gate(gate_cmd: str | None) -> None:
@@ -1589,26 +1638,17 @@ def _measure_once(
     context: int,
     tolerance: float,
     variant_base: int,
-    prompt_lines: int | None = None,
+    prompt_lines: int,
     target_prompt: int | None = None,
     near_context: bool = False,
     gate_cmd: str | None = None,
     off_by_one: bool = False,
 ) -> dict:
     _wait_for_gate(gate_cmd)
-    if prompt_lines is None:
-        prompts = [
-            decode_prompt(variant_base + sample_index * 100 + stream)
-            for stream in range(streams)
-        ]
-    else:
-        prompts = [
-            audit_prompt(
-                prompt_lines,
-                variant_base + sample_index * 100 + stream,
-            )
-            for stream in range(streams)
-        ]
+    prompts = [
+        audit_prompt(prompt_lines, variant_base + sample_index * 100 + stream)
+        for stream in range(streams)
+    ]
     results, wall_seconds = _run_parallel(
         request,
         prompts,
@@ -1637,148 +1677,36 @@ def _measure_once(
     return row
 
 
-def _measure(
+def _measure_capacity(
     request: RequestFn,
-    phase: str,
-    streams: int,
-    samples: int,
-    output_tokens: int,
-    context: int,
-    tolerance: float,
-    variant_base: int,
-    prompt_lines: int | None = None,
-    target_prompt: int | None = None,
-    near_context: bool = False,
-    gate_cmd: str | None = None,
-    min_samples: int | None = None,
-    agreement: float | None = None,
-    off_by_one: bool = False,
-) -> dict:
-    initial = min(min_samples or samples, samples)
-    rows = [
-        _measure_once(
-            request=request,
-            phase=phase,
-            streams=streams,
-            sample_index=sample_index,
-            output_tokens=output_tokens,
-            context=context,
-            tolerance=tolerance,
-            variant_base=variant_base,
-            prompt_lines=prompt_lines,
-            target_prompt=target_prompt,
-            near_context=near_context,
-            gate_cmd=gate_cmd,
-            off_by_one=off_by_one,
-        )
-        for sample_index in range(initial)
-    ]
-    while (
-        agreement is not None
-        and len(rows) < samples
-        and not _samples_agree(rows, agreement)
-    ):
-        print(
-            f"  {phase:<16} n={streams:<2} samples disagree beyond "
-            f"{agreement:.0%}; extending"
-        )
-        rows.append(
-            _measure_once(
-                request=request,
-                phase=phase,
-                streams=streams,
-                sample_index=len(rows),
-                output_tokens=output_tokens,
-                context=context,
-                tolerance=tolerance,
-                variant_base=variant_base,
-                prompt_lines=prompt_lines,
-                target_prompt=target_prompt,
-                near_context=near_context,
-                gate_cmd=gate_cmd,
-                off_by_one=off_by_one,
-            )
-        )
-    return _summarize_measurements(streams, rows)
-
-
-def _measure_family(
-    request: RequestFn,
-    phase: str,
     streams: tuple[int, ...],
     settings: Settings,
-    samples: int,
-    output_tokens: int,
     context: int,
-    variant_base: int,
-    prompt_lines: int | None = None,
-    target_prompt: int | None = None,
-    near_context: bool = False,
+    prompt_lines: int,
+    target_prompt: int,
 ) -> dict:
-    rows = {stream_count: [] for stream_count in streams}
-
-    def _run_pass(sample_index: int) -> None:
-        order = streams if sample_index % 2 == 0 else tuple(reversed(streams))
-        for stream_count in order:
-            rows[stream_count].append(
+    """The near-context proof: one 1-token batch per stream count, once."""
+    return {
+        "by_streams": {
+            str(count): _summarize_measurements(count, [
                 _measure_once(
                     request=request,
-                    phase=phase,
-                    streams=stream_count,
-                    sample_index=sample_index,
-                    output_tokens=output_tokens,
+                    phase="capacity_near",
+                    streams=count,
+                    sample_index=0,
+                    output_tokens=1,
                     context=context,
                     tolerance=settings.tolerance,
-                    variant_base=variant_base + stream_count * 10000,
+                    variant_base=180000 + count * 10000,
                     prompt_lines=prompt_lines,
                     target_prompt=target_prompt,
-                    near_context=near_context,
+                    near_context=True,
                     gate_cmd=settings.gate_cmd,
                     off_by_one=settings.tolerate_off_by_one,
                 )
-            )
-
-    passes = min(settings.min_samples, samples)
-    for sample_index in range(passes):
-        _run_pass(sample_index)
-    # A full extra pass keeps the alternating stream order symmetric, so a
-    # single disagreeing stream count extends every count in this family.
-    while passes < samples and any(
-        not _samples_agree(rows[stream_count], settings.sample_agreement)
-        for stream_count in streams
-    ):
-        print(
-            f"  {phase:<16} samples disagree beyond "
-            f"{settings.sample_agreement:.0%}; extending"
-        )
-        _run_pass(passes)
-        passes += 1
-    results = {
-        str(stream_count): _summarize_measurements(
-            stream_count, rows[stream_count]
-        )
-        for stream_count in streams
-    }
-    one = results["1"]["end_to_end_output_tokens_per_second"]["median"]
-    scaling = {
-        stream_count: (
-            result["end_to_end_output_tokens_per_second"]["median"] / one
-            if one
-            else 0
-        )
-        for stream_count, result in results.items()
-    }
-    peak_streams, peak = max(
-        results.items(),
-        key=lambda item: item[1]["end_to_end_output_tokens_per_second"]["median"],
-    )
-    return {
-        "by_streams": results,
-        "scaling_vs_1x": scaling,
-        "peak_streams": int(peak_streams),
-        "peak_end_to_end_output_tokens_per_second": peak[
-            "end_to_end_output_tokens_per_second"
-        ]["median"],
+            ])
+            for count in streams
+        }
     }
 
 
@@ -1852,30 +1780,23 @@ def _plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
 
 
-def _plan_lines(plan: dict) -> list[str]:
+def _plan_lines(plan: dict, profile: str) -> list[str]:
     """Describe the planned workload; the whole point of a dry run."""
+    if profile == "conversation":
+        return [f"  conversation: {plan['conversation']['steps']} steps, 1 stream"]
     near = plan["capacity_near"]
-    lines = [
-        "  prefill prompts: "
-        + ", ".join(f"{target:,}" for target in plan["prefill_targets"]),
+    session = plan["session"]
+    return [
+        f"  reference: pp{REFERENCE_PROMPT_TOKENS} and "
+        f"tg{REFERENCE_OUTPUT_TOKENS}, {REFERENCE_REPS} reps, 1 stream",
         f"  near-context capacity: {near['target_prompt_tokens']:,}-token "
         f"prompt at streams {_stream_list(near['streams'])}",
-        f"  decode ceiling: {plan['decode']['output_tokens']:,} output "
-        f"tokens at streams {_stream_list(plan['decode']['streams'])}",
+        f"  session: {session['steps']} steps from "
+        f"{session['evidence_tokens']:,}-token evidence, turns up to "
+        f"{session['turn_output_tokens']:,} tokens, report up to "
+        f"{session['report_output_tokens']:,}, streams "
+        f"{_stream_list(session['streams'])}",
     ]
-    for phase in plan["audit_phases"]:
-        lines.append(
-            f"  {phase['name']}: {phase['target_prompt_tokens']:,}-token "
-            f"prompt, {phase['output_tokens']:,} output tokens, streams "
-            f"{_stream_list(phase['streams'])}"
-        )
-    lines.append(
-        f"  conversation and replay: {plan['conversation']['steps']} steps "
-        f"of {plan['conversation']['evidence_tokens']:,}-token evidence, "
-        f"concurrent replay streams "
-        f"{_stream_list(plan['replay_concurrent']['streams'])}"
-    )
-    return lines
 
 
 def _summary_lines(result: dict) -> list[str]:
@@ -1883,6 +1804,9 @@ def _summary_lines(result: dict) -> list[str]:
     metadata = result["metadata"]
     settings = result["settings"]
     plan = result["plan"]
+    sampling = " ".join(
+        f"{key}={value}" for key, value in (settings.get("sampling") or {}).items()
+    ) or "undeclared"
     lines = [
         "",
         f"=== {result['protocol']} summary: "
@@ -1892,23 +1816,19 @@ def _summary_lines(result: dict) -> list[str]:
         f"profile={settings['profile']} "
         f"slots={metadata['active_slots']} "
         f"kv-pool={metadata['kv_pool_tokens']:,}",
+        f"sampling: {sampling}",
     ]
     if settings["dry_run"]:
         lines += ["", "plan only; no server was contacted"]
-        lines += _plan_lines(plan)
-    if result.get("prefill"):
-        lines += ["", "prefill curve (1 stream, 1 output token)"]
-        lines += _table(
-            ["prompt", "wall s", "input tok/s"],
-            [
-                [
-                    f"{int(target):,}",
-                    f"{_median_of(section, 'wall_seconds'):.2f}",
-                    f"{_median_of(section, 'aggregate_prompt_tokens_per_second'):,.0f}",
-                ]
-                for target, section in result["prefill"].items()
-            ],
-        )
+        lines += _plan_lines(plan, settings["profile"])
+    reference = result.get("reference")
+    if reference:
+        lines += [
+            "",
+            "reference, llama-bench method (1 stream, greedy, depth ~0; "
+            "not a serving result)",
+            f"  {_reference_line(reference)}",
+        ]
     near = result.get("capacity_near")
     if near:
         target = plan["capacity_near"]["target_prompt_tokens"]
@@ -1918,63 +1838,75 @@ def _summary_lines(result: dict) -> list[str]:
             "1 output token)",
         ]
         lines += _table(
-            ["streams", "wall s", "input tok/s", "calls/h"],
+            ["streams", "wall s", "input tok/s"],
             [
                 [
                     count,
                     f"{_median_of(section, 'wall_seconds'):.2f}",
                     f"{_median_of(section, 'aggregate_prompt_tokens_per_second'):,.0f}",
-                    f"{_median_of(section, 'calls_per_hour'):.1f}",
                 ]
                 for count, section in near["by_streams"].items()
             ],
         )
-    decode = result.get("decode")
-    if decode:
-        lines += [
-            "",
-            f"decode ceiling ({settings['output_tokens']:,} output tokens, "
-            "short prompt)",
-        ]
+    session = result.get("audit_session")
+    if session:
+        lines += ["", f"agent session ({_plural(session['steps'], 'step')})"]
         lines += _table(
-            ["streams", "output tok/s", "vs 1x"],
+            ["streams", "sessions/h", "vs 1x", "complete", "out tok",
+             "prefill tok/s", "decode first/mid/last", "report tok/s",
+             "cached"],
             [
                 [
                     count,
-                    f"{_median_of(section, 'end_to_end_output_tokens_per_second'):.2f}",
-                    f"{decode['scaling_vs_1x'][count]:.2f}",
+                    f"{_median_of(section, 'sessions_per_hour'):.2f}",
+                    f"{session['scaling_vs_1x'][count]:.2f}",
+                    f"{section['sessions'] - section['sessions_incomplete']}"
+                    f"/{section['sessions']}",
+                    f"{section['output_tokens_per_session']:,.0f}",
+                    _rate(section["prefill_tokens_per_second"]),
+                    "/".join(
+                        _rate(section["turn_decode_tokens_per_second"][position])
+                        for position in ("first", "middle", "last")
+                    ),
+                    _rate(section["report_decode_tokens_per_second"]),
+                    _cached(section["cached_fraction_median"]),
                 ]
-                for count, section in decode["by_streams"].items()
+                for count, section in session["by_streams"].items()
             ],
         )
         lines.append(
-            f"  peak at {_plural(decode['peak_streams'], 'stream')}: "
-            f"{decode['peak_end_to_end_output_tokens_per_second']:.2f} tok/s"
+            "  decode rates are per stream; sessions/h is the production metric"
         )
-    audits = result.get("audits")
-    if audits:
-        lines += ["", "end-to-end audit calls"]
-        lines += _table(
-            ["phase", "prompt", "out", "streams", "wall s", "calls/h",
-             "tok/s"],
-            [
-                [
-                    name,
-                    f"{phase['target_prompt_tokens']:,}",
-                    f"{phase['output_tokens']:,}",
-                    count,
-                    f"{_median_of(section, 'wall_seconds'):.1f}",
-                    f"{_median_of(section, 'calls_per_hour'):.1f}",
-                    f"{_median_of(section, 'end_to_end_output_tokens_per_second'):.2f}",
-                ]
-                for name, phase in audits.items()
-                for count, section in phase["by_streams"].items()
-            ],
-        )
-        lines.append(
-            "  calls/h is the production metric; tok/s is delivered output "
-            "over total wall, prefill included"
-        )
+        totals = {
+            key: sum(
+                section[key] for section in session["by_streams"].values()
+            )
+            for key in ("sessions_incomplete", "truncated_calls",
+                        "empty_turns", "unreasoned_calls")
+        }
+        if totals["sessions_incomplete"]:
+            lines.append(
+                f"  {_plural(totals['sessions_incomplete'], 'session')} "
+                "incomplete: the report hit its cap or missed findings"
+            )
+        if totals["truncated_calls"]:
+            lines.append(
+                f"  {_plural(totals['truncated_calls'], 'call')} hit the "
+                "output cap"
+            )
+        if totals["empty_turns"]:
+            lines.append(
+                f"  {_plural(totals['empty_turns'], 'turn')} ended with no "
+                "text and no tool call"
+            )
+        if totals["unreasoned_calls"]:
+            calls = sum(
+                section["sessions"] for section in session["by_streams"].values()
+            ) * (session["steps"] + 1)
+            lines.append(
+                f"  {totals['unreasoned_calls']} of {calls} calls streamed "
+                "no reasoning"
+            )
     conversation = result.get("audit_conversation")
     if conversation:
         samples = conversation["samples"]
@@ -2002,54 +1934,6 @@ def _summary_lines(result: dict) -> list[str]:
             "  prompt tokens from cache: "
             + _cached(conversation["cached_fraction_median"]),
         ]
-    replay = result.get("audit_replay")
-    if replay:
-        samples = replay["samples"]
-        verdict = statistics.median(
-            [row["verdict_completion_tokens"] for row in samples]
-        )
-        lines += [
-            "",
-            f"audit replay ({_plural(replay['steps'], 'step')}, "
-            f"{_plural(len(samples), 'sample')})",
-            f"  wall {_median_of(replay, 'wall_seconds'):.1f} s, "
-            f"{_median_of(replay, 'replays_per_hour'):.1f} replays/hour",
-            f"  first turn "
-            f"{_median_of(replay, 'first_turn_wall_seconds'):.1f} s, "
-            f"final turn "
-            f"{_median_of(replay, 'final_turn_wall_seconds'):.1f} s",
-            f"  verdict {verdict:,.0f} tokens at "
-            f"{_median_of(replay, 'verdict_output_tokens_per_second'):.2f} "
-            "tok/s",
-            "  prompt tokens from cache: "
-            + _cached(replay["cached_fraction_median"]),
-        ]
-    concurrent = result.get("audit_replay_concurrent")
-    if concurrent:
-        lines += [
-            "",
-            "concurrent audit replay "
-            f"({_plural(concurrent['steps'], 'step')})",
-        ]
-        lines += _table(
-            ["streams", "wall s", "replays/h", "verdict tok/s", "cached",
-             "vs 1x"],
-            [
-                [
-                    count,
-                    f"{_median_of(section, 'wall_seconds'):.1f}",
-                    f"{_median_of(section, 'replays_per_hour'):.1f}",
-                    f"{_median_of(section, 'verdict_output_tokens_per_second'):.2f}",
-                    _cached(section["cached_fraction_median"]),
-                    f"{concurrent['scaling_vs_1x'][count]:.2f}",
-                ]
-                for count, section in concurrent["by_streams"].items()
-            ],
-        )
-        lines.append(
-            f"  peak at {_plural(concurrent['peak_streams'], 'stream')}: "
-            f"{concurrent['peak_replays_per_hour']:.1f} replays/hour"
-        )
     reasons = result["publication_reasons"]
     lines += [
         "",
@@ -2065,16 +1949,22 @@ def _summary_lines(result: dict) -> list[str]:
 def _document_row(
     path: pathlib.Path, directory: pathlib.Path
 ) -> list[str] | None:
-    """One listing row, or None when the file is not an audit-v1 document."""
+    """One listing row, or None when the file is not an AuditBench document."""
     name = str(path.relative_to(directory))
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         # A truncated result is named, not hidden: it may be a lost run.
         return ["-", "-", "-", "unreadable", name]
-    if not isinstance(document, dict) or document.get("protocol") != PROTOCOL:
+    if not isinstance(document, dict) or document.get("protocol") not in (
+        PROTOCOL, LEGACY_PROTOCOL
+    ):
         return None
     metadata = document.get("metadata") or {}
+    profile = str((document.get("settings") or {}).get("profile") or "-")
+    if document["protocol"] == LEGACY_PROTOCOL:
+        # Retained v1 history stays discoverable, marked as the old protocol.
+        profile = f"v1 {profile}"
     if "publishable" not in document or "publication_reasons" not in document:
         # Exactly what --show refuses to render, named the same way.
         verdict = "legacy"
@@ -2085,7 +1975,7 @@ def _document_row(
     return [
         str(metadata.get("started_at_utc") or "-")[:19],
         f"{metadata.get('runtime') or '-'}/{metadata.get('tag') or '-'}",
-        str((document.get("settings") or {}).get("profile") or "-"),
+        profile,
         verdict,
         name,
     ]
@@ -2160,6 +2050,12 @@ def _show(path: pathlib.Path, output_format: str) -> int:
         ) from None
     except (OSError, ValueError) as exc:
         raise SystemExit(f"cannot read {path}: {exc}") from exc
+    if document.get("protocol") == LEGACY_PROTOCOL:
+        raise SystemExit(
+            f"{path} is an {LEGACY_PROTOCOL} document; this harness renders "
+            f"{PROTOCOL} only. Read the JSON directly, or --show it from an "
+            f"llm-audit-bench checkout at {LEGACY_HARNESS_COMMIT}"
+        )
     if document.get("protocol") != PROTOCOL:
         raise SystemExit(
             f"{path} is not a {PROTOCOL} document: "
@@ -2220,7 +2116,7 @@ def run_benchmark(
     openai_chat: Callable | None = None,
     output_format: str = "human",
 ) -> int:
-    """Run AuditBench v1, retain the JSON, and print progress plus result.
+    """Run AuditBench v2, retain the JSON, and print progress plus result.
 
     The result goes to stdout as the human summary, or as the one-line JSON
     document with output_format="json"; the JSON is retained on disk either
@@ -2253,12 +2149,10 @@ def run_benchmark(
         f"context={context:,} canonical={settings.canonical} ==="
     )
     print(
-        f"streams={settings.streams} deep-streams={settings.deep_streams} "
-        f"profile={settings.profile} "
+        f"profile={settings.profile} streams={settings.streams} "
         f"samples={settings.min_samples}-{settings.samples} "
         f"(agreement {settings.sample_agreement:.0%}) "
-        f"output={settings.output_tokens} "
-        f"deep-output={settings.deep_output_tokens}"
+        f"sampling={settings.sampling or 'undeclared'}"
     )
     if settings.gate_cmd:
         print(f"gate: {settings.gate_cmd}")
@@ -2267,6 +2161,11 @@ def run_benchmark(
         return 0
     if request is None:
         raise ValueError("request adapter is required unless AUDIT_BENCH_DRY_RUN=1")
+    if openai_chat is None:
+        raise ValueError(
+            "the session and conversation profiles need an OpenAI-compatible "
+            "chat adapter (openai_chat)"
+        )
 
     print("warmup:")
     warmup = request("Reply with the single word ok.", 1, 1)
@@ -2280,27 +2179,6 @@ def run_benchmark(
                 else "(backends must honor max_tokens exactly)"
             )
         )
-
-    if settings.profile == "decode":
-        print("decode ceiling:")
-        decode = _measure_family(
-            request=request,
-            phase="decode",
-            streams=tuple(plan["decode"]["streams"]),
-            settings=settings,
-            samples=settings.samples,
-            output_tokens=settings.output_tokens,
-            context=context,
-            variant_base=200000,
-        )
-        _emit(
-            {
-                **_result_envelope(settings, metadata, plan),
-                "decode": decode,
-            },
-            output_format,
-        )
-        return 0
 
     print("token calibration:")
     low_lines = 64
@@ -2317,117 +2195,45 @@ def run_benchmark(
         f"  calibration {low_lines} lines={low.prompt_tokens:,} tokens, "
         f"{high_lines} lines={high.prompt_tokens:,} tokens"
     )
-
-    if settings.profile in ("conversation", "replay", "replay-concurrent"):
-        if openai_chat is None:
-            raise ValueError(
-                f"the {settings.profile} profile needs an OpenAI-compatible "
-                "chat adapter (openai_chat)"
-            )
-        if settings.profile == "conversation":
-            print("audit conversation:")
-            key = "audit_conversation"
-            section = _measure_conversations(
-                openai_chat, calibration, context, settings
-            )
-        elif settings.profile == "replay":
-            print("audit replay:")
-            key = "audit_replay"
-            section = _measure_replays(
-                openai_chat, calibration, context, settings
-            )
-        else:
-            print("concurrent audit replay:")
-            key = "audit_replay_concurrent"
-            section = _measure_replay_concurrent(
-                openai_chat, calibration, context, settings,
-                tuple(plan["replay_concurrent"]["streams"]),
-            )
-        _emit(
-            {
-                **_result_envelope(settings, metadata, plan),
-                "calibration": asdict(calibration),
-                key: section,
-            },
-            output_format,
-        )
-        return 0
-
-    prefill = {}
-    print("prefill curve:")
-    for index, target in enumerate(plan["prefill_targets"]):
-        lines = calibration.lines_for(target)
-        prefill[str(target)] = _measure(
-            request=request,
-            phase=f"prefill_{target // 1024}k",
-            streams=1,
-            samples=settings.samples,
-            output_tokens=1,
-            context=context,
-            tolerance=settings.tolerance,
-            variant_base=100000 + index * 10000,
-            prompt_lines=lines,
-            target_prompt=target,
-            gate_cmd=settings.gate_cmd,
-            min_samples=settings.min_samples,
-            agreement=settings.sample_agreement,
-            off_by_one=settings.tolerate_off_by_one,
-        )
-
-    near_plan = plan["capacity_near"]
-    print("near-context capacity:")
-    capacity_near = _measure_family(
-        request=request,
-        phase="capacity_near",
-        streams=tuple(near_plan["streams"]),
-        settings=settings,
-        samples=near_plan["samples"],
-        output_tokens=near_plan["output_tokens"],
-        context=context,
-        variant_base=180000,
-        prompt_lines=calibration.lines_for(near_plan["target_prompt_tokens"]),
-        target_prompt=near_plan["target_prompt_tokens"],
-        near_context=True,
-    )
-    print("decode ceiling:")
-    decode = _measure_family(
-        request=request,
-        phase="decode",
-        streams=tuple(plan["decode"]["streams"]),
-        settings=settings,
-        samples=settings.samples,
-        output_tokens=settings.output_tokens,
-        context=context,
-        variant_base=200000,
-    )
-    audits = {}
-    for index, phase in enumerate(plan["audit_phases"]):
-        print(f"{phase['name']}:")
-        target = phase["target_prompt_tokens"]
-        audits[phase["name"]] = {
-            "target_prompt_tokens": target,
-            "output_tokens": phase["output_tokens"],
-            **_measure_family(
-                request=request,
-                phase=phase["name"],
-                streams=tuple(phase["streams"]),
-                settings=settings,
-                samples=settings.samples,
-                output_tokens=phase["output_tokens"],
-                context=context,
-                variant_base=300000 + index * 100000,
-                prompt_lines=calibration.lines_for(target),
-                target_prompt=target,
-            ),
-        }
     result = {
         **_result_envelope(settings, metadata, plan),
         "calibration": asdict(calibration),
-        "prefill": prefill,
-        "capacity_near": capacity_near,
-        "decode": decode,
-        "audits": audits,
     }
+
+    if settings.profile == "conversation":
+        print("audit conversation:")
+        result["audit_conversation"] = _measure_conversations(
+            openai_chat, calibration, context, settings
+        )
+        if not result["audit_conversation"]["compliant"]:
+            result["publishable"] = False
+            result["publication_reasons"].append("noncompliant_conversation")
+        _emit(result, output_format)
+        return 0
+
+    print("reference (llama-bench method):")
+    result["reference"] = _measure_reference(request, calibration, settings)
+    near_plan = plan["capacity_near"]
+    print("near-context capacity:")
+    result["capacity_near"] = _measure_capacity(
+        request=request,
+        streams=tuple(near_plan["streams"]),
+        settings=settings,
+        context=context,
+        prompt_lines=calibration.lines_for(near_plan["target_prompt_tokens"]),
+        target_prompt=near_plan["target_prompt_tokens"],
+    )
+    print("agent session:")
+    result["audit_session"] = _measure_sessions(
+        openai_chat, calibration, context, settings,
+        tuple(plan["session"]["streams"]),
+    )
+    if any(
+        section["sessions_incomplete"]
+        for section in result["audit_session"]["by_streams"].values()
+    ):
+        result["publishable"] = False
+        result["publication_reasons"].append("incomplete_sessions")
     _emit(result, output_format)
     return 0
 
@@ -2502,13 +2308,15 @@ def _cli_capacity(
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run AuditBench v1 against an OpenAI-compatible chat endpoint."""
+    """Run AuditBench v2 against an OpenAI-compatible chat endpoint."""
     parser = argparse.ArgumentParser(
         prog="audit-bench",
         description=(
-            "Run AuditBench v1 against an OpenAI-compatible chat endpoint. "
-            "AUDIT_BENCH_* environment variables select the profile and "
-            "protocol overrides; see docs/PROTOCOL.md."
+            "Run AuditBench v2 against an OpenAI-compatible chat endpoint. "
+            "Set AUDIT_BENCH_SAMPLING to the checkpoint's sampling, or the "
+            "run is not canonical. AUDIT_BENCH_* environment variables "
+            "select the profile and protocol overrides; see "
+            "docs/PROTOCOL.md."
         ),
     )
     parser.add_argument(
@@ -2539,10 +2347,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--profile",
-        choices=(
-            "full", "decode", "conversation", "replay", "replay-concurrent"
-        ),
-        help="workload profile (default full; overrides AUDIT_BENCH_PROFILE)",
+        choices=("session", "conversation"),
+        help="workload profile (default session; overrides AUDIT_BENCH_PROFILE)",
     )
     parser.add_argument(
         "--timeout",
@@ -2598,9 +2404,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         os.environ["AUDIT_BENCH_DRY_RUN"] = "1"
     dry_run = os.environ.get("AUDIT_BENCH_DRY_RUN", "0") == "1"
-    # Documented decode-compliance controls (docs/PROTOCOL.md) forwarded to
-    # the adapters so each is both sent with every request and recorded in
-    # the JSON: the documented parameter and the system-role control.
+    # Documented reasoning controls (docs/PROTOCOL.md) forwarded to the
+    # adapters so each is both sent with every request and recorded in the
+    # JSON: the documented parameter and the system-role control.
     reasoning_effort = os.environ.get("AUDIT_BENCH_REASONING_EFFORT") or None
     system_prompt = os.environ.get("AUDIT_BENCH_SYSTEM_PROMPT") or None
 
@@ -2609,7 +2415,7 @@ def main(argv: list[str] | None = None) -> int:
         "--active-slots",
         "AUDIT_BENCH_ACTIVE_SLOTS",
         1,
-        "--active-slots not given; assuming 1, concurrency phases run 1x only",
+        "--active-slots not given; assuming 1, sessions run 1x only",
     )
     kv_pool_tokens = _cli_capacity(
         args.kv_tokens,
@@ -2674,7 +2480,7 @@ def main(argv: list[str] | None = None) -> int:
             None
             if dry_run
             else openai_chat_fn(
-                args.base_url,
+                args.base_url.rstrip("/") + "/v1",
                 model,
                 args.timeout,
                 reasoning_effort=reasoning_effort,

@@ -1,31 +1,34 @@
-# AuditBench v1
+# AuditBench v2
 
-AuditBench v1 is the canonical serving benchmark for models used by the
-non-interactive security-audit workload. It replaces runtime-specific prompt
-sizes with one protocol shared by every measured runtime. The harness in this
-repository (`audit_bench.py`) owns every workload shape, validation rule, and
-metric; runtime adapters supply only transport, capacity facts, and identity
-evidence.
+AuditBench v2 is the canonical serving benchmark for models used by agentic
+security audits and deep agentic coding sessions. It replaces
+runtime-specific prompt sizes with one protocol shared by every measured
+runtime. The harness in this repository (`audit_bench.py`) owns every
+workload shape, validation rule, and metric; runtime adapters supply only
+transport, capacity facts, and identity evidence.
 
 The benchmark measures serving performance and capacity. It does not score
-answer quality. A model still needs separate tool-call, reasoning, and audit
-correctness gates before it belongs in the serving inventory.
+answer quality. A model also needs a Capability Check pass
+([CAPABILITY.md](CAPABILITY.md)) before it belongs in the serving inventory.
 
 ## Workload model
 
-The production workload consists of hundreds of independent audits. A request
-typically begins with about 32k tokens of repository evidence, generates a long
-reasoning or tool response, and may return later with a much larger context.
-Several audits can be active concurrently for days.
+The production workload is an agent session: a system instruction, tools,
+and repository evidence, then a tool loop in which every step resends the
+whole growing conversation with a tool result landing mid-context, ending in
+a deliverable -- an audit report or a code change. Many sessions run
+concurrently against one server for days.
 
-The benchmark therefore measures all of these separately:
+The benchmark measures exactly that shape, at the model's own sampling:
 
-- common absolute prompt sizes for fair host and runtime comparisons;
-- capacity-relative prompts for the middle and end of a long audit;
-- isolated decode throughput and end-to-end audit-call throughput;
-- canonical 1, 2, 4, and 8 stream points that fit the operating point; and
-- near-ceiling requests at 1x and the maximum fitting canonical stream count,
-  proving the configured context and aggregate capacity really work.
+- the reference pp512/tg128 by llama-bench's method, for comparison with
+  published figures, not a serving result;
+- the near-context capacity proof, a gate that the configured context
+  really serves;
+- the agent session, the serving benchmark, at one stream and at the
+  largest canonical stream count the operating point admits; and
+- the audit conversation, the model-usability check, where the model
+  drives the tool loop itself.
 
 ## Canonical settings
 
@@ -33,112 +36,86 @@ The benchmark therefore measures all of these separately:
 | -- | --: |
 | Minimum configured context | 131,072 |
 | Preferred configured context | at least 262,144 |
-| Profile | `full` |
+| Profile | `session` |
 | Measured samples | adaptive: 2, extended toward 3 on disagreement |
-| Sample agreement | 5% wall-time spread |
-| Prompt target tolerance | 2% |
-| Candidate decode streams | 1, 2, 4, 8 |
-| Candidate deep-context streams | 1, 2, 4 |
-| Normal output | 1,024 tokens per request |
-| Deep-context output | 256 tokens per request |
+| Sample agreement | 5% spread |
+| Prompt target tolerance (`AUDIT_BENCH_TARGET_TOLERANCE`) | 2% |
+| Candidate streams | 1, 2, 4, 8 |
 | Near-ceiling target | 15/16 of configured context |
-| Late-audit target | 7/8 of configured context |
-| Temperature | 0 |
+| Sampling | declared by the model configuration |
 
 Each sample uses different deterministic audit evidence from the first token,
-so independent requests cannot collapse into a shared prefix-cache hit. Stream
+so independent samples cannot collapse into a shared prefix-cache hit. Stream
 counts are interleaved across sample passes to reduce thermal and power
 ordering bias. Results report the median and retain the minimum, maximum, and
 raw samples.
 
 ### Adaptive sampling
 
-Sampling was originally a fixed 3 per batch. With the 140 W
-adapter-contract gate and battery floor enforced before every batch, the
-systematic variance those repetitions guarded against is prevented rather
-than averaged out, so the canonical protocol now runs 2 samples and
-extends toward 3 only on disagreement. Two samples agree when their batch
-wall times lie within the 5% agreement spread; every reported rate of a
-fixed-shape batch derives from its wall time, so that one criterion
-covers them all. A disagreement automatically restores median-of-3 for
-the affected batch -- in stream-count families, one disagreeing count
-extends the whole family by a full interleaved pass, keeping the ordering
-symmetric. The near-context capacity proof still runs once.
+The canonical protocol runs 2 samples and extends toward 3 only on
+disagreement. In a stream-count family, one disagreeing count extends
+the whole family by a full interleaved pass, keeping the ordering symmetric.
+The near-context capacity proof runs once.
 
-The two agreeing samples keep the internal consistency check that fixed
-sampling provided: a contaminated or degrading sample surfaces as
-disagreement and triggers the third measurement instead of silently
-becoming canonical. Existing median-of-3 rows remain valid and
-comparable; no remeasurement is implied.
+What must agree depends on the workload. A session decodes at natural
+lengths under sampling, so its wall time varies with the model's own
+choices; its samples agree when the prefill rate and the report decode rate
+each lie within the spread. A conversation's samples agree on wall time.
 
-`AUDIT_BENCH_MIN_SAMPLES` and `AUDIT_BENCH_SAMPLE_AGREEMENT` configure
-the initial count and the spread; `AUDIT_BENCH_SAMPLES` remains the
-maximum. `AUDIT_BENCH_MIN_SAMPLES=3` restores fixed median-of-3, and like
-any changed canonical setting it marks the run `canonical: false`.
+`AUDIT_BENCH_MIN_SAMPLES` and `AUDIT_BENCH_SAMPLE_AGREEMENT` configure the
+initial count and the spread; `AUDIT_BENCH_SAMPLES` remains the maximum.
+`AUDIT_BENCH_MIN_SAMPLES=3` restores fixed median-of-3, and like any changed
+canonical setting it marks the run `canonical: false`.
 
-Every runtime receives one user chat message through its native chat endpoint.
-Raw text-generation endpoints are not comparable because they omit the model's
-production chat template.
+### Declared sampling
 
-The control instruction asks the model to continue beyond the measured output
-limit so runtimes without an `ignore_eos` option still reach the fixed token
-count. A response that ends early is rejected; it is never padded, retried
-inside a sample, or reported as a shorter equivalent workload.
+Live clients decode at the checkpoint's recommended sampling, so the
+benchmark does too. The model configuration declares it -- from the
+checkpoint's `generation_config.json` at the pinned revision, or the model
+card when that file carries none -- and the adapter passes it as
+`AUDIT_BENCH_SAMPLING`, space-separated `key=value` pairs:
 
-### Model-documented decode-compliance controls
+```text
+AUDIT_BENCH_SAMPLING="temperature=0.6 top_p=0.95 top_k=20"
+```
 
-Some strongly preference-tuned models deliberate at their default reasoning
-effort and then decline the synthetic control workload instead of complying
-(first observed: Muse Glimmer 30B, which at default effort answered the
-never-conclude instruction with an offer to "generate a reasonable excerpt",
-then stopped). For such a model, pinning the vendor's **documented**
-reasoning-effort control -- for Muse Glimmer, a `Reasoning strength: low`
-system message -- is permitted configuration, not a workload change:
+Accepted keys are `temperature`, `top_p`, `top_k`, `min_p`,
+`presence_penalty`, and `repetition_penalty`. The harness sends them on
+every session and conversation chat call and records them in the result's
+settings. A run without a declared `temperature` measures whatever sampler
+the server defaults to and is `canonical: false`. A model whose documented
+default is greedy declares `temperature=0`.
+
+The fixed-length calls (warmup, calibration, reference, near-context proof)
+decode greedily with `ignore_eos`: they measure the engine, not the sampler.
+
+### Model-documented controls
+
+Some models grade reasoning rather than toggling it, and serve at a
+documented effort level. Pinning the vendor's **documented** control is
+permitted configuration, not a workload change:
 
 - Only the vendor's documented mechanism qualifies. Ad-hoc prompt
-  engineering, jailbreak phrasing, or edits to the workload text itself
-  disqualify the run.
+  engineering or edits to the workload text disqualify the run.
 - The workload text stays byte-identical; the control rides in the system
-  role (or the runtime's equivalent documented parameter).
-- The setting is recorded in the run's JSON settings --
-  `AUDIT_BENCH_SYSTEM_PROMPT` for the system-role control,
-  `AUDIT_BENCH_REASONING_EFFORT` for a documented parameter -- and
-  stated in the benchmark document entry. It does not mark the
-  run `canonical: false` -- models already differ in their template-default
-  reasoning behavior inside the same token budgets, and this control pins
-  that same axis explicitly.
-- A model that cannot reach the fixed token count even under its documented
-  control is recorded as protocol-incompatible, not bench-marked with a
-  shorter workload.
-
-The system-role path above is the original mechanism. The parameter path
-(`AUDIT_BENCH_REASONING_EFFORT`, sent as the request `reasoning_effort`
-field) was added for runtimes whose documented control is a parameter --
-LM Studio, vLLM, and OpenAI all document `reasoning_effort`, and strongly
-reasoning-default models such as Qwen3 need it to emit a non-empty answer
-at all. The workload text and the canonical settings table are unchanged,
-and the control does not affect `canonical`, so existing results remain
-comparable; the only output change is a new `settings.reasoning_effort`
-key, hence `SCHEMA_VERSION` 4.
+  role (`AUDIT_BENCH_SYSTEM_PROMPT`, a separate message ahead of the
+  workload's own) or in the documented request parameter
+  (`AUDIT_BENCH_REASONING_EFFORT`, sent as `reasoning_effort`).
+- The setting is recorded in the run's JSON settings and stated in the
+  benchmark document entry. It does not mark the run `canonical: false`.
 
 ### Off-by-one token accounting
 
-Amendment (2026-09-24): some servers report `completion_tokens` one lower
-than they decoded when the length cap cuts a response. LM Studio's MLX
-engine (mlx-llm 1.11.0) reports 0 for `max_tokens` 1 and 49 for 50, all
-with `finish_reason` `length`, so the warmup rejects it.
+Some servers report `completion_tokens` one lower than they decoded when the
+length cap cuts a response. LM Studio's MLX engine (mlx-llm 1.11.0) reports 0
+for `max_tokens` 1, so the warmup rejects it.
 `AUDIT_BENCH_TOLERATE_OFF_BY_ONE=1` accepts such a server:
 
-- The gate stays exact. Every warmup and phase response must report exactly
-  one fewer than requested, and must say the length cap cut it. A natural
-  stop at that count, or a server that reports exact counts, still fails.
-- The run is `canonical: false`, and therefore not publishable. Metrics use
-  the server-reported counts unchanged; a reader comparing against exact
-  servers applies the recorded offset.
-- The setting is recorded as `settings.tolerate_off_by_one`, and the OpenAI
-  adapter now records each response's `finish_reason` in `adapter_details`,
-  hence `SCHEMA_VERSION` 6. No workload or canonical setting changed, so
-  existing results remain comparable.
+- The gate stays exact. Every 1-token response must report exactly one
+  fewer than requested, and must say the length cap cut it. A natural stop
+  at that count, or a server that reports exact counts, still fails.
+- The run is `canonical: false`, and therefore not publishable.
+- The setting is recorded as `settings.tolerate_off_by_one`.
 
 Before measuring, each adapter verifies the live model identity, configured
 context, and active slot count where the runtime exposes them. A forgotten
@@ -160,6 +137,11 @@ from publication readiness:
 - `publication_reasons` lists every unmet condition. A dirty checkout can
   therefore run a canonical experiment without being mislabeled as a retained
   result.
+- A measured run is also unpublishable when the model did not do the work:
+  `incomplete_sessions` when any session report hit its cap or missed a
+  finding, `noncompliant_conversation` when the conversation profile was not
+  compliant. A throughput number for work that would be redone live is not
+  a serving result.
 
 The adapter hashes the files it actually executes, including deployed copies
 on remote hosts. Runtime profiles retain both parsed fields and the original
@@ -187,114 +169,169 @@ sampling extension -- and then the result in one of two forms:
 | JSON document | `--format json`, or `output_format="json"` for adapters | The same document that was retained, on one line, as the last line of stdout |
 
 The summary reports medians only. Minima, maxima, every individual sample,
-per-turn conversation rows, and all provenance stay in the JSON: a summary
-is a reading aid and never the retained result. Schema version 5 added
-`artifact_path` and the human default; earlier documents remain comparable
-because no workload or setting changed.
+per-turn rows, and all provenance stay in the JSON: a summary is a reading
+aid and never the retained result.
 
 `audit-bench --show FILE` re-prints a retained document in either format,
 contacting no server and retaining nothing. `FILE` is the name printed by
 `--list`, resolved in the retention directory, or any path that exists as
-given. It refuses a document that predates the `publishable` verdict
-rather than inferring one, and exits 0 whenever it printed.
+given. It refuses a document that predates the `publishable` verdict rather
+than inferring one, and names the last harness commit that renders an
+`audit-v1` document instead of rendering it. It exits 0 whenever it printed.
 
-`audit-bench --list` prints the retention directory
-and indexes what is in it -- time, runtime and tag, profile, verdict, and
-file name, newest first -- so the retained documents are discoverable
-without knowing the path convention. The index covers campaign
-subdirectories, names a file it cannot parse instead of hiding it, and
-counts unrelated JSON in the tree rather than presenting it as a result.
-The index is a human aid; tools read the directory themselves.
+`audit-bench --list` prints the retention directory and indexes what is in
+it -- time, runtime and tag, profile, verdict, and file name, newest first --
+so the retained documents are discoverable without knowing the path
+convention. Retained `audit-v1` documents are listed with a `v1` profile
+prefix. The index covers campaign subdirectories, names a file it cannot
+parse instead of hiding it, and counts unrelated JSON in the tree rather
+than presenting it as a result.
 
 ## Phases
 
 Let `C` be the configured per-request context.
 
-### Prefill curve
+### Reference
 
-Single-stream prefill generates one output token at these prompt targets:
+The first step of the session profile, and the only figures comparable
+with published numbers. It reproduces llama.cpp `llama-bench`'s headline
+pair over the fixed-length request adapter: one stream, greedy, exact
+output lengths, five repetitions reported as mean and sample standard
+deviation.
 
-| Target | Inclusion rule | Purpose |
+| Figure | Method | Rate |
 | -- | -- | -- |
-| 32,768 | always | initial audit prompt |
-| 65,536 | always | common medium prompt |
-| 131,072 | when no more than 7/8 of `C` | common large prompt |
+| `pp512` | A cold prompt of about 512 tokens (calibration moves in whole evidence lines; the actual count is recorded), one output token, a new leading variant per repetition so no prefix is cached | prompt tokens over request seconds: a lower bound that includes HTTP and templating |
+| `tg128` | A minimal prompt decoded to 128 tokens, and the same prompt to one token | 127 over the difference of the two request times: decode steps only, as llama-server's and vLLM's (N-1) over decode time, with prefill and request overhead cancelled |
 
-The harness calibrates the deterministic corpus against the model tokenizer,
-then rejects a measured prompt more than 2% from its target.
+`tg128` runs at a depth of a few template tokens, the closest an endpoint
+gets to `llama-bench`'s empty context; `pp512` includes the first token's
+forward pass, as mlx-lm and HTTP-level measurements do. Neither figure
+enters sessions/hour, agreement, or publication; the step exists only to
+compare an engine or quantization change with published `llama-bench`
+figures.
 
 ### Near-context capacity
 
-Prompts target `15C/16` with one output token. The benchmark runs one request
-and, when different, the highest canonical stream count that fits both active
-admission and the raw KV pool. Every stream must land between 90% and 100% of
-`C`. The proof runs once because it is a capacity gate, not a performance
-sample. An operating point that holds only one near-full request runs only 1x.
+The second step of the session profile. Prompts target `15C/16` with one
+output token. The benchmark runs one request and, when different, the
+highest canonical stream count that fits both active admission and the raw
+KV pool. Every stream must land between 90% and 100% of `C`. The proof runs
+once because it is a capacity gate, not a performance sample. An operating
+point that holds only one near-full request runs only 1x.
 
-### Decode ceiling
+### Agent session
 
-A short control prompt generates exactly 1,024 tokens at each canonical
-1/2/4/8 point that fits active admission and the KV pool. This isolates
-aggregate decode capacity from long-prefill cost. It is the metric used while
-tuning scheduler admission and finding a host's decode knee.
+`AUDIT_BENCH_PROFILE=session`, the default, is the serving benchmark. One
+session is the production call pattern with the transcript scripted by the
+harness:
+
+- The opening is the audit system instruction, the `read_file` tool, and
+  `evidence_tokens` of deterministic audit evidence, which puts the first
+  call above any real agent system prompt.
+- A chain of `steps` evidence files follows, each revealed by the previous
+  tool result. For every file the harness calls the model with the
+  conversation so far, lets it write its natural turn -- reasoning, a note,
+  a tool call -- capped at 2,048 tokens, and discards the output. It then
+  appends its own scripted note, `read_file` call, and the tool result. The
+  resent prefix therefore grows identically for every model on every
+  runtime, and a model that cannot hold the protocol still yields numbers.
+- The final user turn asks for the audit report, with a fix per finding.
+  The report is the deliverable, decoded at its natural length under a
+  16,384-token cap at full conversation depth.
+
+No call carries any control message and the corpus carries no instruction:
+turns and the report are whatever the model writes. Natural lengths are
+recorded, never rejected, padded or retried -- a verbose model costs
+sessions per hour live too.
+
+The report is judged, because it is the session's deliverable. A session is
+complete when the report ends on its own, not at its cap, and names every
+`FINDING:` token the chain carried. Incomplete sessions are counted per
+stream count and make the run unpublishable. Three call-level facts are
+counted without gating: calls that hit their cap (long thinking and a
+runaway both end there, and the count is the evidence), turns that ended
+with neither text nor a tool call, and calls that streamed no reasoning,
+which on a reasoning model means it answered without thinking.
+
+Every call streams with `stream_options.include_usage`. The first streamed
+delta that carries anything but the role -- content, a reasoning field under
+any runtime's name, or a tool call -- closes prefill; the rest of the call is
+decode. Token counts come only from the server's usage chunk; a stream
+without one, a usage chunk without token counts, or a call that reports more
+than one token but streamed no delta, is an error. An end-of-turn-only answer
+streams nothing and counts wholly as prefill.
+
+Stream counts are 1 and the largest canonical candidate that fits active
+admission and the KV pool. Per-stream demand is the final resent
+conversation plus the report cap, with no shared-prefix credit, so admission
+never depends on cache behavior. Within one sample batch every stream
+carries the identical system message, evidence, and opening turn --
+concurrent agents working the same repository -- so a prefix cache may share
+their evidence; each stream's file chain diverges from its first tool
+result. Streams start together on a barrier and then free-run their own
+loops, so natural desync develops exactly as independent agents drift
+apart.
+
+| Setting | Canonical value |
+| -- | --: |
+| `AUDIT_BENCH_CONV_EVIDENCE` | 32,768 |
+| `AUDIT_BENCH_CONV_TOOL_TOKENS` | 8,192 |
+| `AUDIT_BENCH_CONV_MAX_STEPS` | 16 |
+| Turn output cap | 2,048 |
+| Report output cap | 16,384 |
+
+The file count auto-scales so the final conversation stays within 7/8 of the
+configured context, capped at `AUDIT_BENCH_CONV_MAX_STEPS`; at 262,144 the
+turns run from about 33k to about 160k tokens and the report at about 168k.
+
+Reported metrics per stream count, median plus range where sampled:
+
+| Metric | Meaning |
+| -- | -- |
+| Sessions/hour | Streams times 3600 over batch wall; the production metric |
+| Scaling versus 1x | Sessions/hour over the 1x median |
+| Output tokens per session | Every turn plus the report, server-counted |
+| Prefill tok/s | Uncached prompt tokens over time to first token, summed over a session's calls; absent when the server does not report cached tokens |
+| Turn decode tok/s | Per stream, at the first, middle, and last turn: the decode curve against depth |
+| Report decode tok/s | Per stream, the deliverable at full depth: the robust decode figure |
+| Cached fraction | Server-reported cached prompt tokens over prompt tokens |
+| Complete sessions | Sessions whose report ended on its own and recalled every finding, of all sessions |
+| Truncated calls, empty turns, unreasoned calls | Counted health facts, never gating |
+
+A short turn -- a sentence and a tool call -- times its decode over few
+tokens, and a tool parser that holds deltas back until the call is parsed
+moves time from decode into prefill. Turn decode rates are therefore most
+reliable for reasoning models, whose turns are long; the report decode rate
+holds for every model.
+
+Per-turn rows retain prompt, cached, and completion tokens, finish reason,
+time to first token, decode rate, content and reasoning length, and the
+number of tool calls; reasoning text is measured, never retained. Adapters
+record the server's resolved prefix-caching state in the runtime profile;
+cached fractions are read against it.
 
 ### Audit conversation
 
-`AUDIT_BENCH_PROFILE=conversation` runs the one workload shape the phases
-above deliberately cannot measure: the production secaudit call pattern.
-Every phase above is a single-shot request whose samples differ from the
-first token precisely so prefix caches cannot contaminate rates. A real
-audit client does the opposite -- it resends the whole growing
-conversation on every step, with tool results landing mid-context, so
-prefix reuse is the workload itself.
+`AUDIT_BENCH_PROFILE=conversation` is the model-usability check: the model
+itself drives the tool loop over the same fixture and must stop with a
+verdict. Non-compliance means the model deviated from the fixture protocol;
+it is not evidence about server performance, and it does not prove the model
+unusable in production, whose prompting differs from this fixture. Run it
+before committing a model to real audits.
 
-The audit-shaped workload is split into two profiles that must never be
-conflated:
-
-- **conversation** (this section) is the model-usability smoke: the
-  model itself drives the tool loop and must stop with a verdict.
-  Non-compliance here means the model deviated from the fixture
-  protocol -- it is not evidence about server performance, and it does
-  not prove the model unusable in production, whose prompting differs
-  from this fixture. Run it before committing a model to real audits so
-  harness failures are not debugged against a model that produces crap.
-- **replay** (next section) is the pure server-performance benchmark:
-  the harness scripts every turn, so every model on every runtime
-  produces the identical resend-everything shape and a protocol-breaking
-  model still yields prefill and cache numbers.
-
-One conversation: a system instruction plus `evidence_tokens` of
-deterministic audit evidence, then a tool loop over a chain of `steps`
-evidence files, ending in a plain-text verdict turn at depth. Three
-fixture properties were each forced by observed model behavior:
+Three fixture properties were each forced by observed model behavior:
 
 - File names are revealed one at a time -- each tool result names the
-  next file -- because a model given all names upfront batches many
-  reads per turn (qwen3.6 read eight at once), collapsing the resend
-  structure the profile exists to measure. Real audits are sequential
-  because each result informs the next action; the chain encodes that
-  honestly. The harness still answers every call the model makes.
-- Each file carries exactly one extractable `FINDING:` line and the
-  verdict is the collected ledger, because models given semantically
-  empty filler to "analyze" reason unboundedly (16k-token think spirals
-  at temp 0). The bounded task keeps per-turn work realistic, and the
-  verdict's findings recall is recorded as a free correctness signal.
-- The conversational corpus carries NO embedded decode-control line
-  (`audit_prompt(..., output_control=False)`): the single-shot phases
-  embed a never-conclude instruction to hold output lengths, and a
-  model that obeys it inside conversational evidence derails the tool
-  loop entirely (observed: qwen3-coder emitting endless integers
-  mid-audit). An instruction in a reused corpus is part of the workload
-  everywhere the corpus goes.
-
-The file count auto-scales so the final conversation stays within 7/8 of
-the configured context, capped at `conv_max_steps`. Context fit reserves
-only resent tokens (tool results plus a short note per turn): reasoning
-tokens cost wall time but are never resent, so the output value is a
-per-request cap sized for deep-context reasoning bursts, not a per-turn
-context cost. Samples (adaptive, as above) use distinct evidence from
-the first token, so a cache can only reuse a conversation's own prefix
--- exactly what production sees.
+  next file -- because a model given all names upfront batches many reads
+  per turn, collapsing the resend structure. The harness still answers
+  every call the model makes.
+- Each file carries exactly one extractable `FINDING:` line and the verdict
+  is the collected ledger, because models given semantically empty filler
+  to "analyze" reason unboundedly. The verdict's findings recall is
+  recorded as a free correctness signal.
+- The corpus carries no embedded instruction: a model that obeys an
+  instruction inside conversational evidence derails the tool loop.
 
 | Setting | Canonical value |
 | -- | --: |
@@ -303,170 +340,27 @@ the first token, so a cache can only reuse a conversation's own prefix
 | `AUDIT_BENCH_CONV_OUTPUT_TOKENS` | 16,384 |
 | `AUDIT_BENCH_CONV_MAX_STEPS` | 16 |
 
-Reported metrics: conversation wall seconds and conversations/hour
-(median plus range, over compliant samples), per-turn
-wall/prompt/cached/completion tokens, and the median cached-token
-fraction taken from the server's own `prompt_tokens_details.cached_tokens`
-usage field where the runtime reports it -- cache reuse is measured,
-never inferred (the launchers pass `--enable-prompt-tokens-details`
-alongside the APC opt-in for exactly this). A conversation is compliant
-when every turn before the verdict makes at least one tool call, every
-file is read within `steps + 4` turns, and the verdict turn returns
-non-empty text with no tool calls. Non-compliance is recorded, never
-padded around. The profile needs the runtime's OpenAI-compatible chat
-endpoint (all three runtimes expose one); reasoning fields are not
-resent, matching production clients.
-
-Conversation results are canonical at the defaults above and are
-recorded in their own section, never mixed with the cache-neutral phase
-rates. The server's resolved prefix-caching state is part of the result:
-a conversation number without its cache mode is meaningless.
+Calls are not streamed and decode at the declared sampling. Reported
+metrics: conversation wall seconds and conversations/hour (median plus
+range, over compliant samples), per-turn wall/prompt/cached/completion
+tokens, and the median cached-token fraction from the server's own
+`prompt_tokens_details.cached_tokens`. A conversation is compliant when
+every turn before the verdict makes at least one tool call, every file is
+read within `steps + 4` turns, and the verdict turn returns non-empty text
+with no tool calls. Reasoning fields are not resent, matching production
+clients.
 
 When reading a non-compliant sample, its `per_step` records say exactly
-which deviation happened -- check the last turn before concluding
-anything: a verdict turn with `files_remaining: 0` and non-empty text is
-a pass regardless of how few turns it took (batched reads are supported
-and answered); `finish_reason: "length"` with non-empty text is still
-compliant (truncation only hurts recall); an empty `content_excerpt` on
-a reasoning model usually means the verdict landed in a reasoning
-channel, a harness-visible limitation rather than model incapacity;
-only a verdict with files remaining, or tool calls until the `steps + 4`
-turn budget runs out, is genuine protocol non-compliance.
+which deviation happened -- check the last turn before concluding anything:
+a verdict turn with `files_remaining: 0` and non-empty text is a pass
+regardless of how few turns it took; `finish_reason: "length"` with
+non-empty text is still compliant (truncation only hurts recall); an empty
+`content_excerpt` on a reasoning model usually means the verdict landed in a
+reasoning channel; only a verdict with files remaining, or tool calls until
+the `steps + 4` turn budget runs out, is genuine protocol non-compliance.
 
-### Audit replay
-
-`AUDIT_BENCH_PROFILE=replay` is the performance half of the audit pair:
-the same fixture, evidence sizes, file chain, and context-fit math as
-the conversation profile, but the harness drives every turn itself.
-Each turn it calls the model with the conversation so far (that call is
-the measurement), caps the probe output at 32 tokens, discards whatever
-the model produced, and appends its own scripted assistant note plus
-`read_file` call and the tool result. The prefix therefore grows
-identically for every model on every runtime, and there is no
-compliance concept at all: a model that cannot hold the interactive
-protocol still yields per-turn prefill walls and measured cache reuse.
-
-After the last file, a final user turn carries the standard
-never-conclude decode control and the full
-`AUDIT_BENCH_CONV_OUTPUT_TOKENS` cap, forcing a verdict-sized decode at
-depth. Its wall time is the end-to-end cost of producing a verdict on
-this server; the recorded `verdict_completion_tokens` and finish reason
-expose a model that ignored the control and decoded less, keeping rates
-comparable.
-
-Reported metrics: replay wall seconds and replays/hour, first- and
-final-turn prefill walls (the growth curve's endpoints), verdict output
-tokens/second, and the median cached-token fraction -- all median plus
-range under the same adaptive sampling. Replay results are canonical at
-the conversation defaults above and answer "where does the server fail
-to perform" -- cache-on versus cache-off pricing, prefill growth at
-depth, verdict decode under a fat KV. Use conversation numbers for
-whether a model plays along, replay numbers for whether the server
-performs; conversations/hour and replays/hour are different quantities
-(probe turns decode almost nothing) and must never be compared across
-the two profiles.
-
-### Concurrent audit replay
-
-`AUDIT_BENCH_PROFILE=replay-concurrent` measures the multi-agent audit
-shape: N scripted replays running at once against one server, sharing
-the evidence prefix and competing for the same KV pool. Within one
-sample batch every stream carries the identical system message,
-evidence, and opening turn -- concurrent agents working the same
-repository -- so a prefix cache may share their evidence; each stream's
-file chain diverges from its first tool result, so the growing suffixes
-are distinct work. Across samples and stream counts the evidence
-changes from the first token, keeping every batch cold at start.
-
-Two deliberate differences from the 1x replay profile:
-
-- Probe turns decode a realistic agent turn instead of a 32-token
-  prefill probe: the measured call appends an ephemeral decode-control
-  user message and caps output at `AUDIT_BENCH_CONV_TURN_TOKENS`
-  (canonical 1,024, the protocol's normal output size). The control
-  never enters the transcript and the probe output is still discarded,
-  so the resent prefix stays byte-identical across models and runtimes.
-  Recorded per-turn completion tokens expose a model that ignores the
-  control instead of flattering its rate.
-- Streams start together on a barrier and then free-run their own turn
-  loops with no per-turn synchronization, so natural desync develops
-  exactly as independent agents drift apart. First-turn cached tokens
-  are recorded per stream: whichever stream commits the shared evidence
-  first seeds the cache for the rest, and partial first-turn sharing
-  under a simultaneous start is a real property of agents starting
-  together, measured rather than staggered away.
-
-Candidate stream counts are the deep-context candidates (1, 2, 4).
-Fitting counts are conservative: per-stream KV demand is the final
-resent conversation plus the verdict cap, with no shared-prefix credit,
-so admission never depends on cache behavior and counts above the bound
-are never submitted.
-
-| Setting | Canonical value |
-| -- | --: |
-| `AUDIT_BENCH_CONV_TURN_TOKENS` | 1,024 |
-| Candidate streams | 1, 2, 4 |
-| Other settings | as audit conversation |
-
-Reported metrics per stream count: batch wall seconds, aggregate
-replays/hour (streams times 3600 over batch wall), scaling versus the
-in-family 1x, first- and final-turn walls, verdict output
-tokens/second, median per-turn completion tokens, median cached
-fraction, and per-stream first-turn cached tokens. The in-family 1x
-point decodes full turns, so it is a different quantity from the 1x
-replay profile: never compare replays/hour across the two. As with
-replay, a result without the server's resolved prefix-caching state is
-meaningless.
-
-Amendment (2026-08-29): the replay-concurrent profile was added
-alongside the existing profiles, which are unchanged; existing replay
-and conversation results remain valid and comparable. `SCHEMA_VERSION`
-was bumped to 3 for the new `audit_replay_concurrent` result section
-and `replay_concurrent` plan block.
-
-### End-to-end audit calls
-
-These phases include both prompt processing and generation in wall time:
-
-| Phase | Prompt target | Output | Streams |
-| -- | --: | --: | -- |
-| `audit_32k` | 32,768 | 1,024 | fitting canonical 1/2/4/8 points |
-| `audit_half` | `C/2` | 1,024 | 1 |
-| `audit_deep` | `7C/8` | 256 | 1 and maximum fitting candidate |
-
-`audit_32k` is the common-work comparison across every qualifying model.
-`audit_half` measures a long-running audit in the middle of its context.
-`audit_deep` measures the end of a request at 1x and the highest useful
-concurrency without queueing.
-
-For every phase, fitting concurrency is:
-
-```text
-min(active slots, floor(KV pool tokens / per-stream KV demand))
-```
-
-Per-stream demand includes the target prompt, requested output, and a small
-variant-token reserve. Stream counts above that bound are never submitted.
-Ollama's capacity is its allocated context multiplied by effective runner
-slots; vLLM uses the raw pool size printed by the live engine.
-
-## Metrics
-
-| Metric | Meaning |
-| -- | -- |
-| Aggregate prompt tok/s | Prompt tokens divided by batch wall time |
-| End-to-end output tok/s | Generated tokens divided by total batch wall time |
-| Calls/hour | Completed fixed-shape requests divided by batch wall time |
-| Scaling versus 1x | Median end-to-end output rate divided by the 1x median |
-| Peak streams | Submitted stream count with the highest median output rate |
-
-For `decode`, end-to-end output tok/s approximates pure decode because the
-prompt is tiny. For the three audit phases it deliberately includes prefill:
-calls/hour is the primary production metric.
-
-Raw KV-pool size, scheduler admission, and per-request context remain separate
-facts. A vLLM KV pool can exceed one request's maximum and is shared among
-active requests, so no workload is defined as a percentage of raw pool tokens.
+Conversations/hour and sessions/hour are different quantities -- the
+session scripts its transcript -- and are never compared.
 
 ## Tuning before a canonical run
 
@@ -475,25 +369,23 @@ active requests, so no workload is defined as a percentage of raw pool tokens.
    hardware cannot serve more.
 2. Raise the memory budget until the near-ceiling request and teardown remain
    reliable with the required host reserve.
-3. Locate the decode knee with
-   `AUDIT_BENCH_PROFILE=decode AUDIT_BENCH_STREAMS=1,2,3,4,5,6,7,8`. Tune
-   scheduler admission or Ollama parallel slots, then freeze that operating
-   point.
-4. Run the canonical protocol. It automatically omits stream counts that
-   cannot execute concurrently for each workload.
+3. Locate the serving concurrency with noncanonical session runs at
+   `AUDIT_BENCH_STREAMS=1,N` for each candidate `N`. Tune scheduler
+   admission or Ollama parallel slots, then freeze that operating point.
+4. Run the canonical protocol. It automatically runs 1x and the largest
+   canonical stream count that fits.
 5. Record the date, repository commit, model revision, runtime versions, host,
    accelerator, power limit, context, KV policy, memory budget, active slots,
    pool or allocation, and the final AuditBench JSON.
 
-An exploratory stream sweep is intentionally noncanonical. Headline tables use
-the canonical stream counts so results remain comparable after tuning.
-
 ## Running it
 
 The standalone CLI drives any OpenAI-compatible chat endpoint. Supply the
-configured context and, when known, the real operating point:
+configured context, the declared sampling, and, when known, the real
+operating point:
 
 ```bash
+export AUDIT_BENCH_SAMPLING="temperature=0.6 top_p=0.95 top_k=20"
 uv run audit-bench --base-url http://127.0.0.1:8000 --context 131072
 uv run audit-bench --base-url http://gpu-host:8000 --model my-model \
   --context 262144 --active-slots 4 --kv-tokens 1048576
@@ -503,10 +395,10 @@ uv run audit-bench --profile conversation \
 
 `--model` is resolved from `/v1/models` when the endpoint serves exactly one
 model. Without `--active-slots` and `--kv-tokens` the harness assumes one
-slot and one configured context of KV, so concurrency phases run 1x only.
-Every `AUDIT_BENCH_*` variable in this document applies to the CLI
-unchanged. Add `--format json` when a tool consumes stdout; the JSON is
-retained on disk either way.
+slot and one configured context of KV, so sessions run 1x only. Every
+`AUDIT_BENCH_*` variable in this document applies to the CLI unchanged. Add
+`--format json` when a tool consumes stdout; the JSON is retained on disk
+either way.
 
 Managed runtimes run through their own adapters and make targets in the
 serving-configuration repositories, which add capacity discovery from live
@@ -533,13 +425,49 @@ laptop whose charger under-supplies the benchmark load, for example -- may set
 batch and proceeds when it exits zero; a non-zero exit aborts the run instead
 of measuring under an unmet precondition. The gate inserts idle time between
 independent batches only, so it does not change any workload or affect
-canonicality; the command used is recorded in the result's settings. Record
-gate pauses with the run, since a paused host resumes cooler than one that ran
-straight through.
+canonicality; the command used is recorded in the result's settings.
 
 ## Existing measurements
 
 Measured results, host inventories, and operating points live with the
-serving-configuration repositories, never in this one. Do not combine a
-legacy prompt or decode rate with an AuditBench result, and do not derive a
-missing AuditBench value from an old rate or multiplier.
+serving-configuration repositories, never in this one. Do not combine an
+`audit-v1` result with an `audit-v2` one, and do not derive a missing value
+from an old rate or multiplier.
+
+## Amendment: AuditBench v2 (2026-09-26)
+
+v2 replaces v1's serving profiles. v1 results remain history under their
+own protocol and are never compared with v2; every host is re-measured.
+
+What v1 got wrong:
+
+- Its headline decode came from a prompt of about 65 tokens. No agent call
+  starts that shallow, and decode slows with depth, so the number did not
+  predict live sessions.
+- Nothing measured decode between a short prompt and full depth: the
+  single-shot audit phases folded prefill into calls/hour, and replay probe
+  turns decoded 32 tokens.
+- It decoded greedily; live clients sample at the checkpoint's defaults.
+- It forced output lengths with a never-conclude control message, which
+  derailed one model and was refused by another as a prompt injection, so
+  the decode it measured was not an agent's.
+
+What changed:
+
+- Removed: the `full` profile (prefill curve, decode ceiling, `audit_32k`,
+  `audit_half`, `audit_deep`), the `decode` tuning profile, `replay`,
+  `replay-concurrent`, the forced-length output control, and the
+  `AUDIT_BENCH_DEEP_STREAMS`, `AUDIT_BENCH_OUTPUT_TOKENS`,
+  `AUDIT_BENCH_DEEP_OUTPUT_TOKENS`, and `AUDIT_BENCH_CONV_TURN_TOKENS`
+  settings.
+- Added: the `session` profile (default) with streamed timing, and declared
+  sampling (`AUDIT_BENCH_SAMPLING`), required for canonical results of both
+  profiles; and the `reference` step, `llama-bench`'s pp512/tg128 method,
+  labelled as not a serving result.
+- Kept: the near-context capacity proof, now inside `session`; the
+  `conversation` profile, now at the declared sampling; provenance,
+  retention, adaptive sampling, the gate, and the documented controls.
+- Session health: the report must end on its own and recall every finding,
+  or the run is unpublishable; capped calls, empty turns and unreasoned
+  calls are counted, never gating.
+- `PROTOCOL` is `audit-v2` and `SCHEMA_VERSION` is 7.

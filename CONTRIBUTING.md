@@ -24,10 +24,10 @@ itself has no dependencies. All tasks run through make:
 
 | Path | Contents |
 | -- | -- |
-| `src/audit_bench.py` | AuditBench v1 harness and the `audit-bench` CLI |
+| `src/audit_bench.py` | AuditBench v2 harness and the `audit-bench` CLI |
 | `src/capability_check.py` | Capability Check v1 harness and the `capability-check` CLI |
 | `tests/` | Unit tests (stdlib `unittest`) |
-| `docs/PROTOCOL.md` | Canonical AuditBench v1 protocol document |
+| `docs/PROTOCOL.md` | Canonical AuditBench v2 protocol document |
 | `docs/CAPABILITY.md` | Canonical Capability Check v1 protocol document |
 | `AGENTS.md` | The same rules, stated for AI coding agents |
 
@@ -49,9 +49,10 @@ must not break:
   the JSON schema. Capability fixtures and pass conditions live only in
   `capability_check.py`. Runtime adapters (in consumer repositories) own
   transport, model loading, capacity discovery, and identity evidence.
-- The honesty rules are not negotiable: short responses are rejected,
-  never padded or retried inside a sample; token counts come from
-  server-reported usage, never client-side estimates; requested
+- The honesty rules are not negotiable: a fixed-length response that
+  comes back short is rejected, and a natural-length one is recorded at
+  its reported length, never padded or retried inside a sample; token
+  counts come from server-reported usage, never client-side estimates; requested
   concurrency is never reported as active concurrency; failures are
   recorded as failures.
 - The `canonical` versus `publishable` distinction survives every

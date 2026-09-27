@@ -3,6 +3,7 @@ import dataclasses
 import http.client
 import io
 import json
+import re
 import os
 import pathlib
 import tempfile
@@ -12,43 +13,116 @@ import urllib.error
 from unittest import mock
 
 from audit_bench import (
+    SESSION_REPORT_REQUEST,
+    SESSION_REPORT_TOKENS,
+    SESSION_TURN_TOKENS,
     Calibration,
     OpenAIChatAdapter,
     RequestResult,
     Settings,
     _conversation_fixture,
     _file_provenance,
-    _measure,
     _measure_conversations,
-    _measure_family,
-    _measure_replay_concurrent,
-    _measure_replays,
+    _measure_capacity,
+    _measure_sessions,
     _output_dir,
     _publication_status,
     audit_prompt,
     build_plan,
-    REPLAY_PROBE_TOKENS,
     conversation_steps,
-    decode_prompt,
     main,
     openai_chat_fn,
+    parse_sampling,
     parse_streams,
     run_benchmark,
     vllm_capacity,
+)
+
+SAMPLING = {"AUDIT_BENCH_SAMPLING": "temperature=0.6 top_p=0.95 top_k=20"}
+CALIBRATION = Calibration(
+    low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
 )
 
 
 def settings() -> Settings:
     return Settings(
         streams=(1, 2, 4, 8),
-        deep_streams=(1, 2, 4),
-        profile="full",
+        profile="session",
         samples=3,
-        output_tokens=1024,
-        deep_output_tokens=256,
         tolerance=0.02,
         dry_run=True,
+        sampling={"temperature": 0.6},
     )
+
+
+class _Stream:
+    """A server-sent event body, iterated line by line like HTTPResponse."""
+
+    def __init__(self, events: list):
+        self.lines = [
+            (event if isinstance(event, str)
+             else f"data: {json.dumps(event)}").encode() + b"\n"
+            for event in events
+        ]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        return iter(self.lines)
+
+
+def _fake_session_chat(requests: list, completion: int = 40):
+    """Stateless thread-safe streamed fake deriving usage from the messages.
+
+    Hostile on purpose: its turns carry a bogus tool call and no content,
+    the worst case an interactive conversation would fail on. The session
+    must measure it anyway.
+    """
+
+    def chat(messages, tools, max_tokens, sampling=None, stream=False):
+        del tools
+        requests.append({
+            "messages": [dict(item) for item in messages],
+            "max_tokens": max_tokens,
+            "sampling": sampling,
+            "stream": stream,
+        })
+        time.sleep(0.01)
+        prompt = 500 * len(messages)
+        usage = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            # The opening call is cold; every later one reuses all but
+            # the newest 400 tokens.
+            "prompt_tokens_details": {
+                "cached_tokens": prompt - 400 if len(messages) > 3 else 0
+            },
+        }
+        report = messages[-1].get("content") == SESSION_REPORT_REQUEST
+        # The report names every finding the chain carried.
+        findings = re.findall(r"FINDING: (\S+)", " ".join(
+            item.get("content") or "" for item in messages
+            if item.get("role") == "tool"
+        ))
+        return {
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "the report: " + ", ".join(findings)
+                    if report else ""
+                },
+            }],
+            "usage": usage,
+            "timing": {"first_token_seconds": 0.5, "total_seconds": 1.5},
+            "reasoning_chars": 12,
+            "tool_calls": 0 if report else 1,
+        }
+
+    return chat
 
 
 class AuditBenchTest(unittest.TestCase):
@@ -59,21 +133,21 @@ class AuditBenchTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     parse_streams(value)
 
-    def test_128k_plan_uses_common_and_relative_targets(self):
+    def test_128k_plan_fits_capacity_and_sessions(self):
         plan = build_plan(131072, settings(), 2, 285696)
-        self.assertEqual(plan["prefill_targets"], [32768, 65536])
         self.assertEqual(plan["capacity_near"]["target_prompt_tokens"], 122880)
         self.assertEqual(plan["capacity_near"]["streams"], [1, 2])
-        self.assertEqual(plan["decode"]["streams"], [1, 2])
-        self.assertEqual(
-            [phase["target_prompt_tokens"] for phase in plan["audit_phases"]],
-            [32768, 65536, 114688],
-        )
-        self.assertEqual(
-            [phase["streams"] for phase in plan["audit_phases"]],
-            [[1, 2], [1], [1, 2]],
-        )
+        session = plan["session"]
+        # 32,768 + 9 * (8,192 + 256) + 16,384 per stream, no shared-prefix
+        # credit: two fit the 285k pool.
+        self.assertEqual(session["steps"], 9)
+        self.assertEqual(session["per_stream_kv_demand"], 125184)
+        self.assertEqual(session["streams"], [1, 2])
+        self.assertEqual(session["turn_output_tokens"], SESSION_TURN_TOKENS)
+        self.assertEqual(session["report_output_tokens"], SESSION_REPORT_TOKENS)
         self.assertFalse(plan["preferred_256k_context"])
+        self.assertNotIn("decode", plan)
+        self.assertNotIn("audit_phases", plan)
 
     def test_plan_rejects_context_below_128k(self):
         with self.assertRaises(ValueError):
@@ -82,114 +156,55 @@ class AuditBenchTest(unittest.TestCase):
     def test_plan_stops_at_active_slot_limit(self):
         plan = build_plan(262144, settings(), 2, 2748350)
         self.assertEqual(plan["capacity_near"]["streams"], [1, 2])
-        self.assertEqual(plan["decode"]["streams"], [1, 2])
+        self.assertEqual(plan["session"]["streams"], [1, 2])
+        plan = build_plan(262144, settings(), 1, 2748350)
+        self.assertEqual(plan["session"]["streams"], [1])
 
-    def test_256k_plan_adds_common_128k_target(self):
+    def test_256k_plan_runs_one_and_the_serving_concurrency(self):
         plan = build_plan(262144, settings(), 8, 2748350)
-        self.assertEqual(plan["prefill_targets"], [32768, 65536, 131072])
         self.assertEqual(plan["capacity_near"]["target_prompt_tokens"], 245760)
         self.assertEqual(plan["capacity_near"]["streams"], [1, 8])
-        self.assertEqual(
-            [phase["target_prompt_tokens"] for phase in plan["audit_phases"]],
-            [32768, 131072, 229376],
-        )
-        self.assertEqual(
-            [phase["streams"] for phase in plan["audit_phases"]],
-            [[1, 2, 4, 8], [1], [1, 4]],
-        )
+        self.assertEqual(plan["session"]["steps"], 16)
+        self.assertEqual(plan["session"]["per_stream_kv_demand"], 184320)
+        self.assertEqual(plan["session"]["streams"], [1, 8])
         self.assertTrue(plan["preferred_256k_context"])
 
-    def test_720k_plan_avoids_queued_long_context_work(self):
+    def test_720k_plan_takes_the_largest_candidate_the_pool_holds(self):
+        # 746,553 tokens hold four 184,320-token sessions: candidates
+        # 1/2/4 fit, so the plan runs 1x and 4x.
         plan = build_plan(737280, settings(), 8, 746553)
-        self.assertEqual(plan["decode"]["streams"], [1, 2, 4, 8])
         self.assertEqual(plan["capacity_near"]["streams"], [1])
-        self.assertEqual(
-            [phase["streams"] for phase in plan["audit_phases"]],
-            [[1, 2, 4, 8], [1], [1]],
-        )
+        self.assertEqual(plan["session"]["streams"], [1, 4])
 
-    @staticmethod
-    def _timed_request(durations: list[float]):
-        remaining = iter(durations)
-
-        def request(prompt: str, max_tokens: int, seed: int) -> RequestResult:
-            del prompt, seed
-            seconds = next(remaining)
-            time.sleep(seconds)
-            return RequestResult(
-                prompt_tokens=100, output_tokens=max_tokens, seconds=seconds
-            )
-
-        return request
-
-    def test_adaptive_sampling_stops_at_agreeing_minimum(self):
-        with contextlib.redirect_stdout(io.StringIO()):
-            measured = _measure(
-                request=self._timed_request([0.05, 0.05, 0.05]),
-                phase="prefill_32k",
-                streams=1,
-                samples=3,
-                output_tokens=1,
-                context=131072,
-                tolerance=0.02,
-                variant_base=0,
-                min_samples=2,
-                agreement=0.5,
-            )
-        self.assertEqual(len(measured["samples"]), 2)
-
-    def test_adaptive_sampling_extends_to_median_of_three_on_disagreement(self):
-        with contextlib.redirect_stdout(io.StringIO()):
-            measured = _measure(
-                request=self._timed_request([0.02, 0.3, 0.3]),
-                phase="prefill_32k",
-                streams=1,
-                samples=3,
-                output_tokens=1,
-                context=131072,
-                tolerance=0.02,
-                variant_base=0,
-                min_samples=2,
-                agreement=0.05,
-            )
-        self.assertEqual(len(measured["samples"]), 3)
-        self.assertAlmostEqual(
-            measured["wall_seconds"]["median"], 0.3, delta=0.1
-        )
-
-    def test_family_extends_every_count_and_capacity_stays_single(self):
+    def test_capacity_proof_runs_once_per_stream_count(self):
         adaptive = dataclasses.replace(
             settings(), min_samples=2, sample_agreement=0.05
         )
+        def near_full(prompt: str, max_tokens: int, seed: int) -> RequestResult:
+            del prompt, seed
+            return RequestResult(
+                prompt_tokens=122880, output_tokens=max_tokens, seconds=0.01
+            )
+
         with contextlib.redirect_stdout(io.StringIO()):
-            family = _measure_family(
-                request=self._timed_request([0.02, 0.3, 0.3]),
-                phase="decode",
-                streams=(1,),
+            capacity = _measure_capacity(
+                request=near_full,
+                streams=(1, 2),
                 settings=adaptive,
-                samples=3,
-                output_tokens=8,
                 context=131072,
-                variant_base=200000,
+                prompt_lines=4,
+                target_prompt=None,
             )
-            capacity = _measure_family(
-                request=self._timed_request([0.05]),
-                phase="capacity_near",
-                streams=(1,),
-                settings=adaptive,
-                samples=1,
-                output_tokens=8,
-                context=131072,
-                variant_base=180000,
-            )
-        self.assertEqual(len(family["by_streams"]["1"]["samples"]), 3)
-        self.assertEqual(len(capacity["by_streams"]["1"]["samples"]), 1)
+        self.assertEqual(set(capacity), {"by_streams"})
+        for count in ("1", "2"):
+            self.assertEqual(len(capacity["by_streams"][count]["samples"]), 1)
 
     def test_sampling_env_is_validated_and_gates_canonicality(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, SAMPLING, clear=False):
             self.assertTrue(Settings.from_env().canonical)
         with mock.patch.dict(
-            os.environ, {"AUDIT_BENCH_MIN_SAMPLES": "3"}, clear=False
+            os.environ, {**SAMPLING, "AUDIT_BENCH_MIN_SAMPLES": "3"},
+            clear=False,
         ):
             parsed = Settings.from_env()
             self.assertEqual(parsed.min_samples, 3)
@@ -207,11 +222,46 @@ class AuditBenchTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Settings.from_env()
         with mock.patch.dict(
-            os.environ, {"AUDIT_BENCH_SAMPLES": "1"}, clear=False
+            os.environ, {**SAMPLING, "AUDIT_BENCH_SAMPLES": "1"}, clear=False
         ):
             parsed = Settings.from_env()
             self.assertEqual(parsed.min_samples, 1)
             self.assertFalse(parsed.canonical)
+
+    def test_declared_sampling_parses_and_is_required_for_canonical(self):
+        self.assertEqual(
+            parse_sampling("temperature=0.6 top_p=0.95 top_k=20"),
+            {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+        )
+        self.assertEqual(parse_sampling(""), {})
+        for value in ("temp=0.6", "temperature", "top_k=1.5",
+                      "temperature=0.6 temperature=0.7"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    parse_sampling(value)
+        # An undeclared or temperature-less sampler is a server default,
+        # not the checkpoint's: noncanonical.
+        with mock.patch.dict(
+            os.environ, {"AUDIT_BENCH_SAMPLING": ""}, clear=False
+        ):
+            self.assertFalse(Settings.from_env().canonical)
+        with mock.patch.dict(
+            os.environ, {"AUDIT_BENCH_SAMPLING": "top_p=0.9"}, clear=False
+        ):
+            self.assertFalse(Settings.from_env().canonical)
+        with mock.patch.dict(
+            os.environ, {"AUDIT_BENCH_SAMPLING": "temperature=0"}, clear=False
+        ):
+            self.assertTrue(Settings.from_env().canonical)
+
+    def test_retired_profiles_are_rejected(self):
+        for profile in ("full", "decode", "replay", "replay-concurrent"):
+            with self.subTest(profile=profile):
+                with mock.patch.dict(
+                    os.environ, {"AUDIT_BENCH_PROFILE": profile}, clear=False
+                ):
+                    with self.assertRaises(ValueError):
+                        Settings.from_env()
 
     @staticmethod
     def _fake_conversation_chat(
@@ -221,7 +271,8 @@ class AuditBenchTest(unittest.TestCase):
     ):
         state = {"n": 0, "requested": 0}
 
-        def chat(messages, tools, max_tokens):
+        def chat(messages, tools, max_tokens, sampling=None, stream=False):
+            del messages, tools, max_tokens, sampling, stream
             n = state["n"]
             state["n"] += 1
             time.sleep(0.02)
@@ -276,20 +327,20 @@ class AuditBenchTest(unittest.TestCase):
 
     def test_conversation_measures_growth_reuse_and_verdict(self):
         conv = self._conversation_settings()
-        calibration = Calibration(
-            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
-        )
+        sent: list = []
         with contextlib.redirect_stdout(io.StringIO()):
             # Each sample is a fresh conversation against a fresh fake.
             active: list = [self._fake_conversation_chat(3)]
 
-            def per_sample_chat(messages, tools, max_tokens):
+            def per_sample_chat(messages, tools, max_tokens, sampling=None,
+                                stream=False):
+                sent.append((sampling, stream))
                 if len(messages) == 2:
                     active[0] = self._fake_conversation_chat(3)
                 return active[0](messages, tools, max_tokens)
 
             measured = _measure_conversations(
-                per_sample_chat, calibration, 131072, conv
+                per_sample_chat, CALIBRATION, 131072, conv
             )
         self.assertTrue(measured["compliant"])
         self.assertEqual(len(measured["samples"]), 2)
@@ -301,16 +352,17 @@ class AuditBenchTest(unittest.TestCase):
         self.assertGreater(
             measured["conversations_per_hour"]["median"], 0
         )
+        # The model drives the loop at the declared sampling, unstreamed.
+        self.assertTrue(sent)
+        for item in sent:
+            self.assertEqual(item, ({"temperature": 0.6}, False))
 
     def test_conversation_accepts_batched_tool_calls(self):
         conv = self._conversation_settings()
-        calibration = Calibration(
-            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
-        )
         with contextlib.redirect_stdout(io.StringIO()):
             measured = _measure_conversations(
                 self._fake_conversation_chat(3, batch=3),
-                calibration, 131072, conv,
+                CALIBRATION, 131072, conv,
             )
         first = measured["samples"][0]
         self.assertTrue(first["compliant"])
@@ -319,152 +371,155 @@ class AuditBenchTest(unittest.TestCase):
 
     def test_conversation_records_noncompliance_without_padding(self):
         conv = self._conversation_settings()
-        calibration = Calibration(
-            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
-        )
         with contextlib.redirect_stdout(io.StringIO()):
             measured = _measure_conversations(
                 self._fake_conversation_chat(3, break_at=1),
-                calibration, 131072, conv,
+                CALIBRATION, 131072, conv,
             )
         self.assertFalse(measured["compliant"])
         self.assertEqual(len(measured["samples"]), 2)
 
-    @staticmethod
-    def _fake_replay_chat():
-        """A hostile model: empty content and a bogus tool call every turn.
-
-        The replay profile must not care what the model produces, so the
-        fake produces the worst case an interactive conversation would
-        fail on.
-        """
-        state = {"n": 0}
-
-        def chat(messages, tools, max_tokens):
-            del messages, tools
-            n = state["n"]
-            state["n"] += 1
-            time.sleep(0.02)
-            usage: dict = {
-                "prompt_tokens": 1000 * (n + 1),
-                "completion_tokens": max_tokens,
-            }
-            if n > 0:
-                usage["prompt_tokens_details"] = {
-                    "cached_tokens": 1000 * n - 100
-                }
-            message = {
-                "content": "",
-                "tool_calls": [{
-                    "id": "bogus",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": json.dumps({"path": "no/such/file"}),
-                    },
-                }],
-            }
-            return {
-                "choices": [{"message": message, "finish_reason": "length"}],
-                "usage": usage,
-            }
-
-        return chat
-
-    def test_replay_scripts_every_turn_and_measures_the_server(self):
-        conv = self._conversation_settings(profile="replay")
-        calibration = Calibration(
-            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
+    def _session_settings(self, **overrides):
+        base = dataclasses.replace(
+            settings(), min_samples=2, sample_agreement=0.5, conv_max_steps=3
         )
+        return dataclasses.replace(base, **overrides)
+
+    def test_session_scripts_every_turn_and_measures_the_server(self):
         requests: list = []
-        fake = self._fake_replay_chat()
-
-        def chat(messages, tools, max_tokens):
-            requests.append((list(messages), max_tokens))
-            return fake(messages, tools, max_tokens)
-
         with contextlib.redirect_stdout(io.StringIO()):
-            measured = _measure_replays(chat, calibration, 131072, conv)
-        # No compliance concept: the hostile model still gets measured.
-        self.assertNotIn("compliant", measured)
-        self.assertEqual(len(measured["samples"]), 2)
-        first = measured["samples"][0]
-        self.assertEqual(first["steps"], 3)
-        self.assertEqual(len(first["per_step"]), 3)
-        self.assertGreater(first["cached_fraction"], 0)
-        self.assertGreater(measured["replays_per_hour"]["median"], 0)
-        self.assertGreater(
-            measured["verdict_output_tokens_per_second"]["median"], 0
+            measured = _measure_sessions(
+                _fake_session_chat(requests), CALIBRATION, 131072,
+                self._session_settings(), (1,),
+            )
+        one = measured["by_streams"]["1"]
+        self.assertEqual(len(one["samples"]), 2)
+        session = one["samples"][0]["per_stream"][0]
+        self.assertEqual(session["steps"], 3)
+        self.assertEqual(len(session["per_step"]), 3)
+        # Four calls of 40 tokens; decode is (40 - 1) tokens over the
+        # second after the first token, prefill the uncached prompt over
+        # time to first token.
+        self.assertEqual(session["output_tokens"], 160)
+        self.assertAlmostEqual(
+            session["report"]["decode_tokens_per_second"], 39.0
         )
-        # First sample: three probe-capped scripted turns, then the
-        # forced full-cap verdict at depth.
-        probe_caps = [request[1] for request in requests[:3]]
-        self.assertEqual(probe_caps, [REPLAY_PROBE_TOKENS] * 3)
-        verdict_messages, verdict_cap = requests[3]
-        self.assertEqual(verdict_cap, conv.conv_output_tokens)
-        self.assertIn("BENCHMARK CONTROL", verdict_messages[-1]["content"])
-        # The scripted assistant turn replaced the model's bogus output.
-        scripted = verdict_messages[2]
+        self.assertAlmostEqual(
+            session["turn_decode_tokens_per_second"]["first"], 39.0
+        )
+        self.assertAlmostEqual(
+            session["prefill_tokens_per_second"], (1000 + 3 * 400) / 2.0
+        )
+        self.assertTrue(session["complete"])
+        self.assertGreater(one["sessions_per_hour"]["median"], 0)
+        self.assertEqual(measured["scaling_vs_1x"]["1"], 1.0)
+        # First sample: three natural-length turns, then the report, every
+        # call streamed at the declared sampling with no control message.
+        first = requests[:4]
+        self.assertEqual(
+            [item["max_tokens"] for item in first],
+            [SESSION_TURN_TOKENS] * 3 + [SESSION_REPORT_TOKENS],
+        )
+        for item in first:
+            self.assertTrue(item["stream"])
+            self.assertEqual(item["sampling"], {"temperature": 0.6})
+            for message in item["messages"]:
+                self.assertNotIn(
+                    "BENCHMARK CONTROL", message.get("content") or ""
+                )
+        report_messages = first[3]["messages"]
+        self.assertEqual(report_messages[-1]["content"], SESSION_REPORT_REQUEST)
+        # The scripted assistant turn replaced the model's own output.
+        scripted = report_messages[2]
         self.assertEqual(scripted["role"], "assistant")
-        self.assertNotEqual(scripted["content"], "")
         self.assertEqual(
             json.loads(
                 scripted["tool_calls"][0]["function"]["arguments"]
             )["path"],
             "file_001",
         )
-        self.assertIn("file_001", verdict_messages[3]["content"])
+        self.assertIn("file_001", report_messages[3]["content"])
 
-    def test_replay_profile_is_canonical_at_defaults(self):
-        with mock.patch.dict(
-            os.environ, {"AUDIT_BENCH_PROFILE": "replay"}, clear=False
-        ):
-            self.assertTrue(Settings.from_env().canonical)
+    def test_session_flags_an_empty_report_without_padding(self):
+        def silent(messages, tools, max_tokens, sampling=None, stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            body["choices"][0]["message"]["content"] = ""
+            return body
 
-    def test_replay_concurrent_profile_is_canonical_at_defaults(self):
-        with mock.patch.dict(
-            os.environ,
-            {"AUDIT_BENCH_PROFILE": "replay-concurrent"},
-            clear=False,
-        ):
-            self.assertTrue(Settings.from_env().canonical)
-        with mock.patch.dict(
-            os.environ,
-            {"AUDIT_BENCH_PROFILE": "replay-concurrent",
-             "AUDIT_BENCH_CONV_TURN_TOKENS": "256"},
-            clear=False,
-        ):
-            self.assertFalse(Settings.from_env().canonical)
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_sessions(
+                silent, CALIBRATION, 131072, self._session_settings(), (1,),
+            )
+        one = measured["by_streams"]["1"]
+        self.assertEqual(one["sessions_incomplete"], 2)
+        report = one["samples"][0]["per_stream"][0]["report"]
+        self.assertEqual(report["content_chars"], 0)
 
-    def test_plan_includes_replay_concurrent_block(self):
-        plan = build_plan(262144, settings(), 8, 2748350)
-        block = plan["replay_concurrent"]
-        self.assertEqual(block["steps"], 16)
-        self.assertEqual(block["turn_output_tokens"], 1024)
-        # 32,768 + 16 * (8,192 + 256) + 16,384 per stream, no
-        # shared-prefix credit.
-        self.assertEqual(block["per_stream_kv_demand"], 184320)
-        self.assertEqual(block["streams"], [1, 2, 4])
+    def test_session_health_counts_caps_and_missed_findings(self):
+        def forgetful(messages, tools, max_tokens, sampling=None,
+                      stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            if messages[-1].get("content") == SESSION_REPORT_REQUEST:
+                # One finding dropped from an otherwise complete report.
+                text = body["choices"][0]["message"]["content"]
+                body["choices"][0]["message"]["content"] = text.rsplit(
+                    ",", 1)[0]
+            else:
+                body["choices"][0]["finish_reason"] = "length"
+            return body
 
-    def test_replay_concurrent_streams_respect_pool_and_slots(self):
-        # A 611k pool holds three per-stream demands; the deep-stream
-        # candidates prune to 1 and 2.
-        plan = build_plan(262144, settings(), 5, 611156)
-        self.assertEqual(plan["replay_concurrent"]["streams"], [1, 2])
-        # One-slot admission runs 1x only regardless of pool size.
-        plan = build_plan(262144, settings(), 1, 2748350)
-        self.assertEqual(plan["replay_concurrent"]["streams"], [1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_sessions(
+                forgetful, CALIBRATION, 131072,
+                self._session_settings(min_samples=1, samples=1), (1,),
+            )
+        one = measured["by_streams"]["1"]
+        session = one["samples"][0]["per_stream"][0]
+        self.assertEqual(session["report_findings_recalled"], 2)
+        self.assertFalse(session["complete"])
+        self.assertEqual(one["truncated_calls"], 3)
+        self.assertEqual(one["sessions_incomplete"], 1)
 
-    def test_replay_concurrent_fixture_shares_evidence_diverges_chains(self):
-        conv = self._conversation_settings(profile="replay-concurrent")
-        calibration = Calibration(
-            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
-        )
+    def test_session_extends_on_rate_disagreement_not_wall_time(self):
+        calls = {"n": 0}
+
+        def drifting(messages, tools, max_tokens, sampling=None, stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            calls["n"] += 1
+            # The second sample's server decodes twice as slowly.
+            if calls["n"] > 4:
+                body["timing"] = {"first_token_seconds": 0.5,
+                                  "total_seconds": 2.5}
+            return body
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_sessions(
+                drifting, CALIBRATION, 131072,
+                self._session_settings(sample_agreement=0.05), (1,),
+            )
+        self.assertEqual(len(measured["by_streams"]["1"]["samples"]), 3)
+
+    def test_concurrent_sessions_share_evidence_and_diverge_chains(self):
+        requests: list = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_sessions(
+                _fake_session_chat(requests), CALIBRATION, 131072,
+                self._session_settings(), (1, 2),
+            )
+        self.assertEqual(set(measured["by_streams"]), {"1", "2"})
+        two = measured["by_streams"]["2"]
+        self.assertEqual(len(two["samples"]), 2)
+        self.assertEqual(len(two["samples"][0]["per_stream"]), 2)
+        self.assertGreater(two["sessions_per_hour"]["median"], 0)
+        self.assertIn("2", measured["scaling_vs_1x"])
         steps_a, evidence_a, _, files_a = _conversation_fixture(
-            calibration, 131072, conv, 900000, 901000
+            CALIBRATION, 131072, self._session_settings(), 900000, 901000
         )
         steps_b, evidence_b, _, files_b = _conversation_fixture(
-            calibration, 131072, conv, 900000, 902000
+            CALIBRATION, 131072, self._session_settings(), 900000, 902000
         )
         self.assertEqual(steps_a, steps_b)
         # Same repository context: the shared evidence prefix is
@@ -474,87 +529,64 @@ class AuditBenchTest(unittest.TestCase):
         self.assertEqual(list(files_a), list(files_b))
         self.assertNotEqual(files_a["file_001"], files_b["file_001"])
 
+    def _one_session(self, chat):
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_sessions(
+                chat, CALIBRATION, 131072,
+                self._session_settings(min_samples=1, samples=1), (1,),
+            )
+        return measured["by_streams"]["1"]["samples"][0]["per_stream"][0]
+
     @staticmethod
-    def _fake_concurrent_chat(requests: list):
-        """Stateless thread-safe fake deriving usage from the messages."""
-
-        def chat(messages, tools, max_tokens):
-            del tools
-            requests.append(([dict(item) for item in messages], max_tokens))
-            time.sleep(0.01)
-            prompt = 500 * len(messages)
-            usage = {"prompt_tokens": prompt, "completion_tokens": max_tokens}
-            if len(messages) > 3:
-                usage["prompt_tokens_details"] = {
-                    "cached_tokens": prompt - 400
-                }
-            message = {"content": "x", "tool_calls": []}
-            return {
-                "choices": [{"message": message, "finish_reason": "length"}],
-                "usage": usage,
-            }
-
+    def _patched(**changes):
+        def chat(messages, tools, max_tokens, sampling=None, stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            for key, value in changes.items():
+                body[key] = value(body[key]) if callable(value) else value
+            return body
         return chat
 
-    def test_replay_concurrent_measures_shared_prefix_batches(self):
-        conv = self._conversation_settings(profile="replay-concurrent")
-        calibration = Calibration(
-            low_lines=64, low_tokens=1380, high_lines=256, high_tokens=5220
+    def test_session_prefill_needs_reported_cache_counts(self):
+        # A server that omits cached counts cannot say how much it
+        # prefilled; the rate is absent rather than a full-prompt guess.
+        uncached = self._patched(usage=lambda usage: {
+            key: value for key, value in usage.items()
+            if key != "prompt_tokens_details"
+        })
+        session = self._one_session(uncached)
+        self.assertIsNone(session["prefill_tokens_per_second"])
+        self.assertIsNotNone(session["report"]["decode_tokens_per_second"])
+
+    def test_session_counts_an_end_of_turn_only_answer_as_prefill(self):
+        silent = self._patched(
+            usage=lambda usage: {**usage, "completion_tokens": 1},
+            timing={"first_token_seconds": None, "total_seconds": 1.0},
         )
-        requests: list = []
-        chat = self._fake_concurrent_chat(requests)
+        session = self._one_session(silent)
+        self.assertEqual(session["report"]["first_token_seconds"], 1.0)
+        self.assertIsNone(session["report"]["decode_tokens_per_second"])
+
+    def test_session_rejects_usage_without_token_counts(self):
+        for usage in ({"prompt_tokens": 0, "completion_tokens": 5},
+                      {"prompt_tokens": 100}):
+            with self.subTest(usage=usage):
+                with self.assertRaisesRegex(RuntimeError, "lacks token counts"):
+                    self._one_session(self._patched(usage=usage))
+
+    def test_session_refuses_a_count_it_cannot_time(self):
+        def untimed(messages, tools, max_tokens, sampling=None, stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            body["timing"] = {"first_token_seconds": None, "total_seconds": 1}
+            return body
+
         with contextlib.redirect_stdout(io.StringIO()):
-            measured = _measure_replay_concurrent(
-                chat, calibration, 131072, conv, (1, 2)
-            )
-        self.assertEqual(set(measured["by_streams"]), {"1", "2"})
-        two = measured["by_streams"]["2"]
-        self.assertEqual(len(two["samples"]), 2)
-        self.assertGreater(two["replays_per_hour"]["median"], 0)
-        self.assertIn("2", measured["scaling_vs_1x"])
-        self.assertEqual(
-            two["turn_completion_tokens_median"], conv.conv_turn_tokens
-        )
-        # Probe turns decode to the turn cap under an ephemeral control
-        # riding at the end of the measured call only.
-        probes = [item for item in requests
-                  if item[1] == conv.conv_turn_tokens]
-        self.assertTrue(probes)
-        for messages, _ in probes:
-            self.assertEqual(messages[-1]["role"], "user")
-            self.assertIn("BENCHMARK CONTROL", messages[-1]["content"])
-        # The ephemeral control never enters the transcript: verdict
-        # requests carry exactly one control, the permanent verdict one.
-        verdicts = [item for item in requests
-                    if item[1] == conv.conv_output_tokens]
-        self.assertEqual(len(verdicts), 6)
-        for messages, _ in verdicts:
-            controls = [
-                item for item in messages
-                if "BENCHMARK CONTROL" in (item.get("content") or "")
-            ]
-            self.assertEqual(len(controls), 1)
-
-    def test_plan_includes_replay_block(self):
-        plan = build_plan(262144, settings(), 2, 2748350)
-        self.assertEqual(plan["replay"]["steps"], 16)
-        self.assertEqual(
-            plan["replay"]["probe_output_tokens"], REPLAY_PROBE_TOKENS
-        )
-        self.assertEqual(plan["replay"]["verdict_output_tokens"], 16384)
-
-    def test_conversation_profile_is_canonical_at_defaults(self):
-        with mock.patch.dict(
-            os.environ, {"AUDIT_BENCH_PROFILE": "conversation"}, clear=False
-        ):
-            self.assertTrue(Settings.from_env().canonical)
-        with mock.patch.dict(
-            os.environ,
-            {"AUDIT_BENCH_PROFILE": "conversation",
-             "AUDIT_BENCH_CONV_TOOL_TOKENS": "512"},
-            clear=False,
-        ):
-            self.assertFalse(Settings.from_env().canonical)
+            with self.assertRaisesRegex(RuntimeError, "cannot be timed"):
+                _measure_sessions(
+                    untimed, CALIBRATION, 131072, self._session_settings(),
+                    (1,),
+                )
 
     def test_plan_includes_conversation_block(self):
         plan = build_plan(262144, settings(), 2, 2748350)
@@ -585,17 +617,10 @@ class AuditBenchTest(unittest.TestCase):
                 with self.subTest(target=target, variant=variant):
                     self.assertLessEqual(abs(actual - target) / target, 0.02)
 
-    def test_output_prompts_require_external_truncation(self):
-        for prompt in (audit_prompt(1, 10), decode_prompt(10)):
-            with self.subTest(prompt=prompt):
-                self.assertIn("deliberately truncated by the benchmark", prompt)
-                self.assertIn("Continue for at least 4096 tokens", prompt)
-                self.assertIn("never conclude", prompt)
-
-    def test_conversation_corpus_carries_no_decode_control(self):
-        clean = audit_prompt(1, 10, output_control=False)
-        self.assertNotIn("BENCHMARK CONTROL", clean)
-        self.assertNotIn("never conclude", clean)
+    def test_corpus_carries_no_instruction(self):
+        corpus = audit_prompt(1, 10)
+        self.assertNotIn("BENCHMARK CONTROL", corpus)
+        self.assertNotIn("never conclude", corpus)
 
     def test_vllm_capacity_comes_from_managed_log(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -636,19 +661,19 @@ class AuditBenchTest(unittest.TestCase):
     @staticmethod
     def _fake_request(prompt: str, max_tokens: int, seed: int) -> RequestResult:
         del seed
-        evidence_lines = max(prompt.count("\n") - 2, 0)
+        evidence_lines = max(prompt.count("\n") - 1, 0)
+        # A second of prefill plus 10 ms per decoded token.
         return RequestResult(
             prompt_tokens=100 + evidence_lines * 20,
             output_tokens=max_tokens,
-            seconds=1,
+            seconds=1 + max_tokens / 100,
         )
 
     _FAKE_ENV = {
+        **SAMPLING,
         "AUDIT_BENCH_STREAMS": "1,2",
-        "AUDIT_BENCH_DEEP_STREAMS": "1",
         "AUDIT_BENCH_SAMPLES": "1",
-        "AUDIT_BENCH_OUTPUT_TOKENS": "8",
-        "AUDIT_BENCH_DEEP_OUTPUT_TOKENS": "4",
+        "AUDIT_BENCH_CONV_MAX_STEPS": "2",
         "AUDIT_BENCH_TARGET_TOLERANCE": "0.02",
         "AUDIT_BENCH_DRY_RUN": "0",
     }
@@ -678,19 +703,84 @@ class AuditBenchTest(unittest.TestCase):
                         active_slots=1,
                         kv_pool_tokens=131072,
                         output_format=output_format,
-                        openai_chat=openai_chat,
+                        openai_chat=openai_chat or _fake_session_chat([]),
                     )
         return result, output.getvalue()
 
-    def test_fake_adapter_runs_the_complete_protocol(self):
+    def test_fake_adapter_runs_the_session_protocol(self):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
         self.assertEqual(result, 0)
         report = json.loads(text.splitlines()[-1])
-        self.assertEqual(report["schema_version"], 6)
-        self.assertEqual(report["protocol"], "audit-v1")
+        self.assertEqual(report["schema_version"], 7)
+        self.assertEqual(report["protocol"], "audit-v2")
         self.assertFalse(report["publishable"])
+        self.assertEqual(
+            report["settings"]["sampling"],
+            {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+        )
         self.assertIn("capacity_near", report)
-        self.assertEqual(list(report["decode"]["by_streams"]), ["1"])
+        self.assertEqual(list(report["audit_session"]["by_streams"]), ["1"])
+        for retired in ("prefill", "decode", "audits"):
+            self.assertNotIn(retired, report)
+        self.assertNotIn("incomplete_sessions", report["publication_reasons"])
+
+    def test_incomplete_sessions_make_the_run_unpublishable(self):
+        def capped(messages, tools, max_tokens, sampling=None, stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            body["choices"][0]["finish_reason"] = "length"
+            return body
+
+        _, text = self._run_fake_protocol(
+            {"AUDIT_BENCH_GATE_CMD": ""}, openai_chat=capped
+        )
+        report = json.loads(text.splitlines()[-1])
+        self.assertIn("incomplete_sessions", report["publication_reasons"])
+        _, summary = self._run_fake_protocol(
+            {"AUDIT_BENCH_GATE_CMD": ""}, "human", openai_chat=capped
+        )
+        self.assertIn("1 session incomplete", summary)
+        self.assertIn("3 calls hit the output cap", summary)
+
+    def test_noncompliant_conversation_is_unpublishable(self):
+        # The session fake never calls a tool, so the model-driven loop
+        # stops at once with every file unread.
+        _, text = self._run_fake_protocol(
+            {"AUDIT_BENCH_GATE_CMD": "", "AUDIT_BENCH_PROFILE": "conversation"}
+        )
+        report = json.loads(text.splitlines()[-1])
+        self.assertFalse(report["audit_conversation"]["compliant"])
+        self.assertIn(
+            "noncompliant_conversation", report["publication_reasons"]
+        )
+
+    def test_reference_uses_the_llama_bench_method(self):
+        _, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
+        reference = json.loads(text.splitlines()[-1])["reference"]
+        pp = reference["prompt_processing"]
+        tg = reference["token_generation"]
+        self.assertEqual(len(pp["tokens_per_second"]["reps"]), 5)
+        # Prompt tokens over the whole 1-token request.
+        self.assertAlmostEqual(
+            pp["tokens_per_second"]["mean"], pp["prompt_tokens"][0] / 1.01
+        )
+        # 127 decode steps over the 128-token call minus the 1-token call.
+        self.assertAlmostEqual(tg["tokens_per_second"]["mean"], 100.0)
+        self.assertEqual(tg["tokens_per_second"]["sd"], 0.0)
+        _, summary = self._run_fake_protocol(
+            {"AUDIT_BENCH_GATE_CMD": ""}, "human"
+        )
+        self.assertIn("reference, llama-bench method", summary)
+        self.assertIn("tg128 100.0 +/- 0.0 tok/s", summary)
+
+        def short(prompt, max_tokens, seed):
+            result = self._fake_request(prompt, max_tokens, seed)
+            if max_tokens == 128:
+                return dataclasses.replace(result, output_tokens=90)
+            return result
+
+        with self.assertRaisesRegex(RuntimeError, "reference call returned 90"):
+            self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""}, request=short)
 
     def test_json_document_is_retained_and_named_in_the_summary(self):
         output = io.StringIO()
@@ -706,46 +796,31 @@ class AuditBenchTest(unittest.TestCase):
                         request=self._fake_request,
                         active_slots=1,
                         kv_pool_tokens=131072,
+                        openai_chat=_fake_session_chat([]),
                     )
             text = output.getvalue()
             retained = list(pathlib.Path(directory).glob("*.json"))
             self.assertEqual(len(retained), 1)
             self.assertIn(f"json: {retained[0]}", text)
             report = json.loads(retained[0].read_text(encoding="utf-8"))
-        self.assertEqual(report["schema_version"], 6)
+        self.assertEqual(report["schema_version"], 7)
         self.assertEqual(report["artifact_path"], str(retained[0]))
-        self.assertIn("audits", report)
+        self.assertIn("audit_session", report)
 
-    def test_human_summary_reports_every_measured_phase(self):
+    def test_human_summary_reports_capacity_and_sessions(self):
         _, text = self._run_fake_protocol({}, output_format="human")
         for expected in (
-            "=== audit-v1 summary: fake/fake-model ===",
-            "prefill curve (1 stream, 1 output token)",
+            "=== audit-v2 summary: fake/fake-model ===",
+            "sampling: temperature=0.6 top_p=0.95 top_k=20",
             "near-context capacity",
-            "decode ceiling",
-            "end-to-end audit calls",
-            "audit_32k",
-            "audit_deep",
+            "agent session (2 steps)",
+            "sessions/h",
+            "decode first/mid/last",
             "canonical=no publishable=no",
         ):
             self.assertIn(expected, text)
         # The human report replaces the JSON on stdout, never wraps it.
         self.assertNotIn('"schema_version"', text)
-
-    def test_replay_summary_reports_turns_verdict_and_cache(self):
-        _, text = self._run_fake_protocol(
-            {
-                "AUDIT_BENCH_PROFILE": "replay",
-                "AUDIT_BENCH_CONV_MAX_STEPS": "3",
-                "AUDIT_BENCH_SAMPLE_AGREEMENT": "0.5",
-            },
-            output_format="human",
-            openai_chat=self._fake_replay_chat(),
-        )
-        self.assertIn("audit replay (3 steps, 1 sample)", text)
-        self.assertIn("replays/hour", text)
-        self.assertIn("verdict", text)
-        self.assertIn("prompt tokens from cache: 0.", text)
 
     def test_conversation_summary_reports_compliance_and_recall(self):
         _, text = self._run_fake_protocol(
@@ -760,19 +835,7 @@ class AuditBenchTest(unittest.TestCase):
         self.assertIn("protocol compliant: yes (1 of 1 samples)", text)
         self.assertIn("findings recalled: 0 of 3", text)
         self.assertIn("conversations/hour", text)
-
-    def test_concurrent_replay_summary_tables_each_stream_count(self):
-        _, text = self._run_fake_protocol(
-            {
-                "AUDIT_BENCH_PROFILE": "replay-concurrent",
-                "AUDIT_BENCH_CONV_MAX_STEPS": "3",
-            },
-            output_format="human",
-            openai_chat=self._fake_concurrent_chat([]),
-        )
-        self.assertIn("concurrent audit replay (3 steps)", text)
-        self.assertIn("verdict tok/s", text)
-        self.assertIn("peak at 1 stream:", text)
+        self.assertNotIn("near-context capacity", text)
 
     def test_file_provenance_hashes_exact_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -813,14 +876,15 @@ class AuditBenchTest(unittest.TestCase):
             )
             self.assertEqual(result, 0)
             report = json.loads(text.splitlines()[-1])
-            # 131k plan with one slot: 2 prefill targets, 1 capacity batch,
-            # 1 decode batch, 3 audit batches; warmup and calibration are
-            # direct requests and must not be gated.
+            # 131k plan with one slot: one capacity batch and one session
+            # batch; warmup and calibration are direct requests and must
+            # not be gated.
             gates = marker.read_text(encoding="utf-8").count("gate")
-            self.assertEqual(gates, 7)
+            self.assertEqual(gates, 2)
             self.assertEqual(report["settings"]["gate_cmd"], f"echo gate >> {marker}")
         with mock.patch.dict(
-            os.environ, {"AUDIT_BENCH_GATE_CMD": "true"}, clear=False
+            os.environ, {**SAMPLING, "AUDIT_BENCH_GATE_CMD": "true"},
+            clear=False,
         ):
             self.assertTrue(Settings.from_env().canonical)
 
@@ -837,7 +901,8 @@ class AuditBenchTest(unittest.TestCase):
         report = json.loads(text.splitlines()[-1])
         self.assertEqual(report["settings"]["system_prompt"], control)
         with mock.patch.dict(
-            os.environ, {"AUDIT_BENCH_SYSTEM_PROMPT": control}, clear=False
+            os.environ, {**SAMPLING, "AUDIT_BENCH_SYSTEM_PROMPT": control},
+            clear=False,
         ):
             self.assertTrue(Settings.from_env().canonical)
 
@@ -849,7 +914,8 @@ class AuditBenchTest(unittest.TestCase):
         report = json.loads(text.splitlines()[-1])
         self.assertEqual(report["settings"]["reasoning_effort"], "none")
         with mock.patch.dict(
-            os.environ, {"AUDIT_BENCH_REASONING_EFFORT": "none"}, clear=False
+            os.environ, {**SAMPLING, "AUDIT_BENCH_REASONING_EFFORT": "none"},
+            clear=False,
         ):
             self.assertTrue(Settings.from_env().canonical)
 
@@ -879,6 +945,102 @@ class AuditBenchTest(unittest.TestCase):
         for request in (self._reports_one_fewer("stop"), None):
             with self.assertRaisesRegex(RuntimeError, "one fewer"):
                 self._run_fake_protocol(env, request=request)
+
+    def test_stream_times_the_first_token_and_requires_usage(self):
+        captured = {}
+
+        def respond(events):
+            def fake_urlopen(request, timeout=None):
+                captured["body"] = json.loads(request.data.decode())
+                return _Stream(events)
+            return fake_urlopen
+
+        events = [
+            # vLLM opens with an empty content delta and interim null usage;
+            # neither is a token.
+            {"choices": [{"delta": {"role": "assistant", "content": ""}}],
+             "usage": None},
+            {"choices": [{"delta": {"reasoning": "think"}}], "usage": None},
+            {"choices": [{"delta": {"content": "rep"}}]},
+            {"choices": [{"delta": {"content": "ort"},
+                          "finish_reason": "stop"}]},
+            {"choices": [], "usage": {"prompt_tokens": 9,
+                                      "completion_tokens": 3}},
+            "data: [DONE]",
+        ]
+        chat = openai_chat_fn("http://127.0.0.1:1", "m", 10)
+        with mock.patch("urllib.request.urlopen", side_effect=respond(events)):
+            body = chat([], [], 8, sampling={"temperature": 0.6}, stream=True)
+        self.assertEqual(body["usage"]["completion_tokens"], 3)
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(body["choices"][0]["message"]["content"], "report")
+        self.assertEqual((body["reasoning_chars"], body["tool_calls"]), (5, 0))
+        timing = body["timing"]
+        self.assertIsNotNone(timing["first_token_seconds"])
+        self.assertLessEqual(
+            timing["first_token_seconds"], timing["total_seconds"]
+        )
+        self.assertTrue(captured["body"]["stream"])
+        self.assertEqual(
+            captured["body"]["stream_options"], {"include_usage": True}
+        )
+        self.assertEqual(captured["body"]["temperature"], 0.6)
+        with mock.patch(
+            "urllib.request.urlopen", side_effect=respond(events[:4])
+        ):
+            with self.assertRaisesRegex(RuntimeError, "without a usage chunk"):
+                chat([], [], 8, stream=True)
+        # A turn that is only a tool call starts decode at the call delta.
+        call_only = [
+            {"choices": [{"delta": {"role": "assistant"}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0}]},
+                          "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 9,
+                                      "completion_tokens": 12}},
+        ]
+        with mock.patch("urllib.request.urlopen", side_effect=respond(call_only)):
+            body = chat([], [], 8, stream=True)
+        self.assertIsNotNone(body["timing"]["first_token_seconds"])
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(body["tool_calls"], 1)
+        for bad, message in (
+            ([{"error": {"message": "boom"}}], "stream error"),
+            (["data: {not json"], "malformed stream line"),
+        ):
+            with self.subTest(message=message):
+                with mock.patch(
+                    "urllib.request.urlopen", side_effect=respond(bad)
+                ):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        chat([], [], 8, stream=True)
+
+    def test_chat_fn_sends_only_the_declared_sampling(self):
+        captured = {}
+
+        def fake_urlopen(request, timeout=None):
+            captured["body"] = json.loads(request.data.decode())
+
+            class _Resp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def read(self):
+                    return json.dumps({"choices": [{}], "usage": {}})
+
+            return _Resp()
+
+        chat = openai_chat_fn("http://127.0.0.1:1", "m", 10)
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            chat([], [], 4, sampling={"temperature": 0.6, "top_k": 20})
+        self.assertEqual(captured["body"]["temperature"], 0.6)
+        self.assertEqual(captured["body"]["top_k"], 20)
+        self.assertNotIn("stream", captured["body"])
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            chat([], [], 4)
+        self.assertNotIn("temperature", captured["body"])
 
     def test_adapter_records_finish_reason(self):
         def fake_urlopen(request, timeout=None):
@@ -1080,7 +1242,7 @@ class CliMainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.dict(
                 os.environ,
-                {"AUDIT_BENCH_OUTPUT_DIR": directory},
+                {**SAMPLING, "AUDIT_BENCH_OUTPUT_DIR": directory},
                 clear=False,
             ):
                 with contextlib.redirect_stdout(output):
@@ -1156,8 +1318,8 @@ class CliMainTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("plan only; no server was contacted", text)
-        self.assertIn("prefill prompts: 32,768, 65,536", text)
-        self.assertIn("audit_deep: 114,688-token prompt", text)
+        self.assertIn("near-context capacity: 122,880-token prompt", text)
+        self.assertIn("session: 9 steps from 32,768-token evidence", text)
         self.assertIn("canonical=yes publishable=no (dry_run", text)
         self.assertNotIn('"schema_version"', text)
 
@@ -1212,13 +1374,13 @@ class CliMainTest(unittest.TestCase):
                     ["--show", str(retained), "--format", "json"]
                 )
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(text)["protocol"], "audit-v1")
+        self.assertEqual(json.loads(text)["protocol"], "audit-v2")
 
     def test_show_rejects_a_foreign_document(self):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "capability.json"
             path.write_text('{"protocol": "capability-v1"}', encoding="utf-8")
-            with self.assertRaisesRegex(SystemExit, "not a audit-v1"):
+            with self.assertRaisesRegex(SystemExit, "not a audit-v2"):
                 self._run_main(["--show", str(path)])
             missing = pathlib.Path(directory) / "absent.json"
             with self.assertRaisesRegex(SystemExit, "cannot read"):
@@ -1232,7 +1394,7 @@ class CliMainTest(unittest.TestCase):
             path.write_text(
                 json.dumps(
                     {
-                        "protocol": "audit-v1",
+                        "protocol": "audit-v2",
                         "canonical": True,
                         "settings": {},
                         "metadata": {},
@@ -1245,6 +1407,41 @@ class CliMainTest(unittest.TestCase):
                 SystemExit, "predates the summary: publishable"
             ):
                 self._run_main(["--show", str(path)])
+
+    def test_show_points_a_v1_document_at_its_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "v1.json"
+            path.write_text(
+                json.dumps({"protocol": "audit-v1", "canonical": True}),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                SystemExit, "audit-v1 document.*checkout at 382760d"
+            ):
+                self._run_main(["--show", str(path)])
+
+    def test_cli_sessions_use_the_v1_chat_endpoint(self):
+        card = mock.MagicMock()
+        card.__enter__.return_value = io.BytesIO(json.dumps(
+            {"data": [{"id": "m", "max_model_len": 131072}]}
+        ).encode())
+        with mock.patch("urllib.request.urlopen", return_value=card), \
+                mock.patch("audit_bench.run_benchmark", return_value=0) as run:
+            self._run_main(["--base-url", "http://127.0.0.1:9/",
+                            "--context", "131072"])
+        chat = run.call_args.kwargs["openai_chat"]
+        requested = {}
+
+        def fake_urlopen(request, timeout=None):
+            requested["url"] = request.full_url
+            return _Stream([{"choices": [], "usage": {
+                "prompt_tokens": 1, "completion_tokens": 0}}])
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            chat([], [], 1, stream=True)
+        self.assertEqual(
+            requested["url"], "http://127.0.0.1:9/v1/chat/completions"
+        )
 
     def test_running_still_requires_an_endpoint(self):
         with contextlib.redirect_stderr(io.StringIO()) as errors:
@@ -1263,7 +1460,7 @@ class CliMainTest(unittest.TestCase):
                     main(["--base-url", "http://127.0.0.1:9",
                           "--context", "131072", "--dry-run"])
                     main(["--base-url", "http://127.0.0.1:9",
-                          "--context", "262144", "--profile", "replay",
+                          "--context", "262144", "--profile", "conversation",
                           "--dry-run"])
                 broken = pathlib.Path(directory) / "broken.json"
                 broken.write_text("not json", encoding="utf-8")
@@ -1303,9 +1500,11 @@ class CliMainTest(unittest.TestCase):
         # Newest first, with the unusable file named rather than hidden.
         self.assertIn("campaign-1/archived.json", lines[2])
         self.assertIn("publishable", lines[2])
+        # Retained v1 history stays listed, marked as the old protocol.
+        self.assertIn("v1 full", lines[2])
         self.assertIn("unreadable", lines[3])
-        self.assertIn("replay", lines[4])
-        self.assertIn("full", lines[5])
+        self.assertIn("conversation", lines[4])
+        self.assertIn("session", lines[5])
         self.assertIn("1 other JSON file in the tree, ignored", lines[6])
         self.assertEqual(lines[-1], "re-print one with: audit-bench --show FILE")
 
@@ -1340,12 +1539,11 @@ class CliMainTest(unittest.TestCase):
             campaign = pathlib.Path(directory) / "campaign-1"
             campaign.mkdir()
             document = {
-                "protocol": "audit-v1",
+                "protocol": "audit-v2",
                 "canonical": True,
                 "publishable": True,
                 "publication_reasons": [],
-                "settings": {"profile": "full", "dry_run": False,
-                             "output_tokens": 1024},
+                "settings": {"profile": "session", "dry_run": False},
                 "metadata": {"runtime": "vllm", "tag": "host",
                              "model": "m", "active_slots": 8,
                              "kv_pool_tokens": 742613},
@@ -1367,7 +1565,7 @@ class CliMainTest(unittest.TestCase):
                         code = main(["--show", argument])
                     self.assertEqual(code, 0)
                     self.assertIn(
-                        "=== audit-v1 summary: vllm/host ===",
+                        "=== audit-v2 summary: vllm/host ===",
                         output.getvalue(),
                     )
                     self.assertIn(

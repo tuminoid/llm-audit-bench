@@ -59,8 +59,9 @@ Both modes impose hard rules:
   results remain comparable (or do not); git history carries the dates.
 - A change to the emitted JSON shape bumps `SCHEMA_VERSION` in the affected
   module.
-- Never weaken the honesty rules: short responses are rejected, never
-  padded or retried inside a sample; token counts come from server-reported
+- Never weaken the honesty rules: a fixed-length response that comes back
+  short is rejected, and a natural-length one is recorded at its reported
+  length, never padded or retried inside a sample; token counts come from server-reported
   usage, never client-side estimates; requested concurrency is never
   reported as active concurrency; failures are recorded as failures.
 - The `canonical` versus `publishable` distinction must survive every

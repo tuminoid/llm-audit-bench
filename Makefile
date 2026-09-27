@@ -1,7 +1,7 @@
 .PHONY: help dev test lint markdownlint pycompile clean all
 
 help:
-	@echo "llm-audit-bench - AuditBench v1 and Capability Check v1"
+	@echo "llm-audit-bench - AuditBench v2 and Capability Check v1"
 	@echo ""
 	@echo "  make dev   - Create the uv-managed venv and install the CLIs"
 	@echo "  make test  - Run the unit tests"
