@@ -482,6 +482,30 @@ class AuditBenchTest(unittest.TestCase):
         self.assertEqual(one["truncated_calls"], 3)
         self.assertEqual(one["sessions_incomplete"], 1)
 
+    def test_long_report_may_omit_one_finding(self):
+        def forgetful(messages, tools, max_tokens, sampling=None,
+                      stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            if messages[-1].get("content") == SESSION_REPORT_REQUEST:
+                text = body["choices"][0]["message"]["content"]
+                body["choices"][0]["message"]["content"] = text.rsplit(
+                    ",", 1)[0]
+            return body
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_sessions(
+                forgetful, CALIBRATION, 262144,
+                self._session_settings(min_samples=1, samples=1,
+                                       conv_max_steps=8), (1,),
+            )
+        one = measured["by_streams"]["1"]
+        session = one["samples"][0]["per_stream"][0]
+        self.assertEqual(session["steps"], 8)
+        self.assertEqual(session["report_findings_recalled"], 7)
+        self.assertTrue(session["complete"])
+        self.assertEqual(one["sessions_incomplete"], 0)
+
     def test_session_extends_on_rate_disagreement_not_wall_time(self):
         calls = {"n": 0}
 

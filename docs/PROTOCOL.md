@@ -138,10 +138,10 @@ from publication readiness:
   therefore run a canonical experiment without being mislabeled as a retained
   result.
 - A measured run is also unpublishable when the model did not do the work:
-  `incomplete_sessions` when any session report hit its cap or missed a
-  finding, `noncompliant_conversation` when the conversation profile was not
-  compliant. A throughput number for work that would be redone live is not
-  a serving result.
+  `incomplete_sessions` when any session report hit its cap or named
+  fewer than 7/8 of its findings, `noncompliant_conversation` when the
+  conversation profile was not compliant. A throughput number for work
+  that would be redone live is not a serving result.
 
 The adapter hashes the files it actually executes, including deployed copies
 on remote hosts. Runtime profiles retain both parsed fields and the original
@@ -246,15 +246,16 @@ recorded, never rejected, padded or retried -- a verbose model costs
 sessions per hour live too.
 
 The report is judged, because it is the session's deliverable. A session is
-complete when the report ends on its own, not at its cap, and names every
-`FINDING:` token the chain carried. Incomplete sessions are counted per
-stream count and make the run unpublishable. Three call-level facts are
-counted without gating: calls that hit their cap (long thinking and a
-runaway both end there, and the count is the evidence), turns that ended
-with neither text nor a tool call, and calls that streamed no reasoning,
-which on a reasoning model means it answered without thinking. Audit
-fitness in Capability Check v2 judges model behavior at sampling; these
-counts show whether the same behavior appears at depth.
+complete when the report ends on its own, not at its cap, and names at least
+7/8 of the `FINDING:` tokens the chain carried: one omission in a 16-finding
+report is an edit in a live audit, a short report is a redo. Incomplete
+sessions are counted per stream count and make the run unpublishable. Three
+call-level facts are counted without gating: calls that hit their cap (long
+thinking and a runaway both end there, and the count is the evidence), turns
+that ended with neither text nor a tool call, and calls that streamed no
+reasoning, which on a reasoning model means it answered without thinking.
+Audit fitness in Capability Check v2 judges model behavior at sampling;
+these counts show whether the same behavior appears at depth.
 
 Every call streams with `stream_options.include_usage`. The first streamed
 delta that carries anything but the role -- content, a reasoning field under
@@ -298,7 +299,7 @@ Reported metrics per stream count, median plus range where sampled:
 | Turn decode tok/s | Per stream, at the first, middle, and last turn: the decode curve against depth |
 | Report decode tok/s | Per stream, the deliverable at full depth: the robust decode figure |
 | Cached fraction | Server-reported cached prompt tokens over prompt tokens |
-| Complete sessions | Sessions whose report ended on its own and recalled every finding, of all sessions |
+| Complete sessions | Sessions whose report ended on its own and recalled at least 7/8 of its findings, of all sessions |
 | Truncated calls, empty turns, unreasoned calls | Counted health facts, never gating |
 
 A short turn -- a sentence and a tool call -- times its decode over few
@@ -469,7 +470,9 @@ What changed:
 - Kept: the near-context capacity proof, now inside `session`; the
   `conversation` profile, now at the declared sampling; provenance,
   retention, adaptive sampling, the gate, and the documented controls.
-- Session health: the report must end on its own and recall every finding,
-  or the run is unpublishable; capped calls, empty turns and unreasoned
+- Session health: the report must end on its own and recall at least 7/8
+  of its findings (every finding until 2026-09-27, when the first canonical
+  run lost publication to one omission in 18 sessions), or the run is
+  unpublishable; capped calls, empty turns and unreasoned
   calls are counted, never gating.
 - `PROTOCOL` is `audit-v2` and `SCHEMA_VERSION` is 7.

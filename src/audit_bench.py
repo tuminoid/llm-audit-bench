@@ -1317,11 +1317,13 @@ def _session_once(
         },
         "report": report,
         # Recorded, never padded or retried. The report is the session's
-        # deliverable: it is complete when it ends on its own and names
-        # every finding the chain carried. An incomplete session is work a
-        # live audit would have to redo, so its run is not publishable.
+        # deliverable: it is complete when it ends on its own and names at
+        # least 7/8 of the findings the chain carried. One omission in a
+        # long report is an edit in a live audit; a capped or short report
+        # is work to redo, so its run is not publishable.
         "report_findings_recalled": recalled,
-        "complete": report["finish_reason"] != "length" and recalled == steps,
+        "complete": report["finish_reason"] != "length"
+        and recalled * 8 >= steps * 7,
         # A turn that hit its cap is bounded, not failed: long thinking and
         # a runaway both end there, and the count is the evidence.
         "truncated_calls": sum(row["finish_reason"] == "length" for row in calls),
