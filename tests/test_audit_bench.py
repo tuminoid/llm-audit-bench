@@ -598,19 +598,23 @@ class AuditBenchTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "lacks token counts"):
                     self._one_session(self._patched(usage=usage))
 
-    def test_session_refuses_a_count_it_cannot_time(self):
+    def test_untimed_turn_counts_as_prefill(self):
         def untimed(messages, tools, max_tokens, sampling=None, stream=False):
             body = _fake_session_chat([])(messages, tools, max_tokens,
                                           sampling, stream)
-            body["timing"] = {"first_token_seconds": None, "total_seconds": 1}
+            if messages[-1].get("content") != SESSION_REPORT_REQUEST:
+                body["timing"] = {"first_token_seconds": None,
+                                  "total_seconds": 1}
             return body
 
         with contextlib.redirect_stdout(io.StringIO()):
-            with self.assertRaisesRegex(RuntimeError, "cannot be timed"):
-                _measure_sessions(
-                    untimed, CALIBRATION, 131072, self._session_settings(),
-                    (1,),
-                )
+            measured = _measure_sessions(
+                untimed, CALIBRATION, 131072,
+                self._session_settings(min_samples=1, samples=1), (1,),
+            )
+        session = measured["by_streams"]["1"]["samples"][0]["per_stream"][0]
+        self.assertTrue(session["complete"])
+        self.assertIsNone(session["turn_decode_tokens_per_second"]["first"])
 
     def test_plan_includes_conversation_block(self):
         plan = build_plan(262144, settings(), 2, 2748350)

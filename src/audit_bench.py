@@ -1211,12 +1211,10 @@ def _session_call(
     first = timing["first_token_seconds"]
     total = timing["total_seconds"]
     if first is None:
-        if completion > 1:
-            raise RuntimeError(
-                f"server reported {completion} completion tokens but "
-                "streamed no delta; the call cannot be timed"
-            )
-        # An end-of-turn-only answer streams nothing: all of it is prefill.
+        # Nothing streamed: an end-of-turn-only answer, or tokens the
+        # parser consumed (an empty think block). All of it counts as
+        # prefill and the call has no decode rate; a server that never
+        # streams leaves every turn empty and every report incomplete.
         first = total
     decode_seconds = total - first
     return {
