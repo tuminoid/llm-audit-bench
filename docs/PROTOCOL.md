@@ -472,9 +472,23 @@ What changed:
 - Kept: the near-context capacity proof, now inside `session`; the
   `conversation` profile, now at the declared sampling; provenance,
   retention, adaptive sampling, the gate, and the documented controls.
-- Session health: the report must end on its own and recall at least 7/8
-  of its findings (every finding until 2026-09-27, when the first canonical
-  run lost publication to one omission in 18 sessions), or the run is
-  unpublishable; capped calls, empty turns and unreasoned
-  calls are counted, never gating.
+- Session health: the report must end on its own and recall every
+  finding, or the run is unpublishable; capped calls, empty turns and
+  unreasoned calls are counted, never gating.
 - `PROTOCOL` is `audit-v2` and `SCHEMA_VERSION` is 7.
+
+## Amendment: 2.1.0 (2026-09-28)
+
+The first canonical v2 campaigns changed one publication rule and three
+failure modes. The workload is unchanged, so 2.0.0 and 2.1.0 results
+compare; `PROTOCOL` stays `audit-v2`.
+
+- A complete session names at least 7/8 of its findings, not every one:
+  the first canonical run lost publication to one omission in 18
+  sessions, and at sampling some session drops one in nearly every run.
+- A reference the backend cannot force to an exact length is recorded as
+  unavailable instead of aborting the run (Ollama has no `ignore_eos`).
+- A session call that streams nothing counts all its time as prefill and
+  has no decode rate, instead of aborting the run.
+- The vLLM capacity lookup reads vLLM-Metal 0.30.0's `CPU KV cache size`
+  label.
