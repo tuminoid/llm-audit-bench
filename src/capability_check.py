@@ -1135,7 +1135,8 @@ def triage_prompt() -> tuple[str, dict[str, bool]]:
         f"the {len(truth)} candidates below in the keel-api service, a "
         "Flask application exposed to the internet. `request` is always the "
         "incoming HTTP request. Decide for each candidate whether it is a "
-        "true positive (exploitable as written) or a false positive.\n\n"
+        "true positive (a real vulnerability of the flagged rule's kind, as "
+        "written) or a false positive.\n\n"
         + "\n\n".join(blocks)
         + "\n\n## Output\n\nReturn ONLY a JSON array with one object per "
         'candidate, in candidate order: {"id": "C01", "verdict": '
