@@ -1553,7 +1553,7 @@ class AuditFitnessTest(unittest.TestCase):
                 fitness_samples=1,
             )
         self.assertEqual(code, 0)
-        self.assertIn("fitness workflow: 0/1 failed", output.getvalue())
+        self.assertIn("fitness workflow: 1/1 passed", output.getvalue())
 
 
 if __name__ == "__main__":

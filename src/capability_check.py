@@ -1690,10 +1690,10 @@ def run_audit_fitness(adapter, config: CapabilityConfig, samples: int) -> dict:
         "tasks": tasks,
     }
     if failed >= FITNESS_FAILURE_LIMIT:
+        total = samples * len(tasks)
         raise CheckFailure(
-            f"{failed} of {samples * len(tasks)} audit samples failed ("
-            + ", ".join(f"{name} {count}" for name, count in classes.items())
-            + ")",
+            f"{total - failed} of {total} audit samples passed; failed: "
+            + ", ".join(f"{name} {count}" for name, count in classes.items()),
             evidence,
         )
     return evidence
@@ -1859,11 +1859,11 @@ def _summary_lines(report: dict) -> list[str]:
         causes = collections.Counter(
             row["failure"] for row in task["samples"] if row["failure"]
         )
+        total = len(task["samples"])
         notes.append(
-            f"  fitness {name}: {task['failed']}/{len(task['samples'])} "
-            "failed"
+            f"  fitness {name}: {total - task['failed']}/{total} passed"
             + (
-                " (" + ", ".join(f"{k} {v}" for k, v in causes.items()) + ")"
+                " (failed: " + ", ".join(f"{k} {v}" for k, v in causes.items()) + ")"
                 if causes else ""
             )
         )
