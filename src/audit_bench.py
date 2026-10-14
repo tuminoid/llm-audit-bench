@@ -1114,7 +1114,7 @@ def _run_conversation(
                 unread.discard(path)
             messages.append({
                 "role": "tool",
-                "tool_call_id": call.get("id") or f"call_{turn}_{index}",
+                "tool_call_id": call.get("id") or f"call{turn:03d}{index:02d}",
                 "content": content or f"no such file: {path}",
             })
     total = time.monotonic() - started
@@ -1267,7 +1267,10 @@ def _session_once(
         row = _session_call(chat, messages, SESSION_TURN_TOKENS, settings)
         del row["content"]
         per_step.append({"step": turn + 1, **row})
-        call_id = f"call_{turn + 1:03d}"
+        # Nine alphanumerics, the id shape Mistral's tokenizer requires of
+        # every tool call in the history; vLLM shortens longer ids to it but
+        # rejects shorter or punctuated ones.
+        call_id = f"call{turn + 1:05d}"
         messages.append({
             "role": "assistant",
             "content": SESSION_NOTE,
