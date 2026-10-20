@@ -492,3 +492,19 @@ compare; `PROTOCOL` stays `audit-v2`.
   has no decode rate, instead of aborting the run.
 - The vLLM capacity lookup reads vLLM-Metal 0.30.0's `CPU KV cache size`
   label.
+
+## Amendment: 2.2.0 (2026-10-20)
+
+Two scoring and transcript fixes from the October trials. The workload's
+shape is unchanged: the session transcript differs only in its tool-call
+ids, a few tokens per step, so 2.1.0 and 2.2.0 rates compare; `PROTOCOL`
+stays `audit-v2`.
+
+- Finding recall folds typographic dashes (U+2010 to U+2015 and the minus
+  sign) to an ASCII hyphen before matching. Nemotron 3.5 Lightning writes
+  some reports with U+2011 in every finding token; such a report named all
+  16 findings yet scored none, and its session counted as incomplete.
+- Scripted tool-call ids are nine alphanumerics (`call00001` onwards, and
+  `call{turn:03d}{index:02d}` for the conversation's fallback), the shape
+  vLLM's Mistral tokenizer requires of every id in the history; `call_001`
+  failed every Mistral Small 4 session on its first resent step.
