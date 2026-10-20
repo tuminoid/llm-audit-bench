@@ -969,6 +969,20 @@ def conversation_steps(context: int, settings: Settings) -> int:
     return steps
 
 
+# Typographic dashes a model may write inside a finding token: U+2010 to
+# U+2015 and the minus sign. Recall folds them to "-" before matching, so
+# a report that names every finding is not scored as naming none.
+_DASHES = str.maketrans(
+    {c: "-" for c in "\u2010\u2011\u2012\u2013\u2014\u2015\u2212"}
+)
+
+
+def _recalled(text: str, findings: dict) -> int:
+    """How many finding tokens the text names, typographic dashes folded."""
+    text = text.translate(_DASHES)
+    return sum(token in text for token in findings.values())
+
+
 def _cached_tokens(usage: dict) -> int | None:
     details = usage.get("prompt_tokens_details") or {}
     cached = details.get("cached_tokens")
@@ -1090,9 +1104,7 @@ def _run_conversation(
         if not tool_calls:
             final_text = (message.get("content") or "").strip()
             compliant = bool(final_text) and not unread
-            recalled = sum(
-                token in final_text for token in findings.values()
-            )
+            recalled = _recalled(final_text, findings)
             break
         # Reasoning fields are not resent: production clients resend
         # message content and tool calls only.
@@ -1289,7 +1301,7 @@ def _session_once(
     messages.append({"role": "user", "content": SESSION_REPORT_REQUEST})
     report = _session_call(chat, messages, SESSION_REPORT_TOKENS, settings)
     report_text = report.pop("content")
-    recalled = sum(token in report_text for token in findings.values())
+    recalled = _recalled(report_text, findings)
     total = time.monotonic() - started
     calls = per_step + [report]
     uncached = sum(

@@ -506,6 +506,28 @@ class AuditBenchTest(unittest.TestCase):
         self.assertTrue(session["complete"])
         self.assertEqual(one["sessions_incomplete"], 0)
 
+    def test_report_recall_folds_typographic_dashes(self):
+        # Nemotron 3.5 Lightning writes some reports with U+2011 in every
+        # finding token; the report still names each finding.
+        def typographic(messages, tools, max_tokens, sampling=None,
+                        stream=False):
+            body = _fake_session_chat([])(messages, tools, max_tokens,
+                                          sampling, stream)
+            if messages[-1].get("content") == SESSION_REPORT_REQUEST:
+                message = body["choices"][0]["message"]
+                message["content"] = message["content"].replace("-", "\u2011")
+            return body
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            measured = _measure_sessions(
+                typographic, CALIBRATION, 262144,
+                self._session_settings(min_samples=1, samples=1,
+                                       conv_max_steps=8), (1,),
+            )
+        session = measured["by_streams"]["1"]["samples"][0]["per_stream"][0]
+        self.assertEqual(session["report_findings_recalled"], 8)
+        self.assertTrue(session["complete"])
+
     def test_session_extends_on_rate_disagreement_not_wall_time(self):
         calls = {"n": 0}
 
