@@ -32,7 +32,7 @@ PROTOCOL = "audit-v2"
 # the last harness commit that renders them instead of guessing.
 LEGACY_PROTOCOL = "audit-v1"
 LEGACY_HARNESS_COMMIT = "382760d"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_STREAMS = (1, 2, 4, 8)
 DEFAULT_SAMPLES = 3
 DEFAULT_MIN_SAMPLES = 2
@@ -271,6 +271,7 @@ class Settings:
     gate_cmd: str | None = None
     system_prompt: str | None = None
     reasoning_effort: str | None = None
+    preserve_reasoning: bool = False
     tolerate_off_by_one: bool = False
 
     @classmethod
@@ -358,6 +359,12 @@ class Settings:
             system_prompt=os.environ.get("AUDIT_BENCH_SYSTEM_PROMPT") or None,
             reasoning_effort=os.environ.get("AUDIT_BENCH_REASONING_EFFORT")
             or None,
+            # A model whose card requires prior reasoning in the history
+            # (interleaved thinking) gets it resent; same standing as the
+            # controls above.
+            preserve_reasoning=os.environ.get(
+                "AUDIT_BENCH_PRESERVE_REASONING", "0"
+            ) == "1",
             tolerate_off_by_one=os.environ.get(
                 "AUDIT_BENCH_TOLERATE_OFF_BY_ONE", "0"
             ) == "1",
@@ -430,7 +437,7 @@ def _session_streams(
     steps = conversation_steps(context, settings)
     per_stream = (
         settings.conv_evidence_tokens
-        + steps * (settings.conv_tool_tokens + CONV_NOTE_RESERVE)
+        + steps * _resent_per_step(settings)
         + SESSION_REPORT_TOKENS
     )
     max_streams = min(active_slots, kv_pool_tokens // per_stream)
@@ -895,9 +902,9 @@ def _read_stream(response, endpoint: str, started: float) -> dict:
     finish_reason = None
     usage = None
     content: list[str] = []
-    # Reasoning is measured, never kept: runtimes name the field
-    # reasoning or reasoning_content, and some send both copies.
-    reasoning = {"reasoning": 0, "reasoning_content": 0}
+    # Runtimes name the reasoning field reasoning or reasoning_content,
+    # and some send both copies; the longer one is the reasoning.
+    reasoning: dict[str, list[str]] = {"reasoning": [], "reasoning_content": []}
     tool_calls: set[int] = set()
     for raw in response:
         line = raw.decode(errors="replace").strip()
@@ -926,7 +933,7 @@ def _read_stream(response, endpoint: str, started: float) -> dict:
                 first_token = time.monotonic() - started
             content.append(delta.get("content") or "")
             for field in reasoning:
-                reasoning[field] += len(delta.get(field) or "")
+                reasoning[field].append(delta.get(field) or "")
             tool_calls.update(
                 call.get("index", 0) for call in delta.get("tool_calls") or []
             )
@@ -944,9 +951,20 @@ def _read_stream(response, endpoint: str, started: float) -> dict:
         }],
         "usage": usage,
         "timing": {"first_token_seconds": first_token, "total_seconds": total},
-        "reasoning_chars": max(reasoning.values()),
+        "reasoning_chars": max(len("".join(parts)) for parts in reasoning.values()),
+        "reasoning_text": max(("".join(parts) for parts in reasoning.values()), key=len),
         "tool_calls": len(tool_calls),
     }
+
+
+def _resent_per_step(settings: Settings) -> int:
+    """Tokens one step adds to the resent conversation: the tool result and
+    a short assistant note, plus, under preserve_reasoning, the turn's
+    reasoning, bounded by a session turn's cap."""
+    per_step = settings.conv_tool_tokens + CONV_NOTE_RESERVE
+    if settings.preserve_reasoning:
+        per_step += SESSION_TURN_TOKENS
+    return per_step
 
 
 def conversation_steps(context: int, settings: Settings) -> int:
@@ -954,11 +972,13 @@ def conversation_steps(context: int, settings: Settings) -> int:
 
     Only resent tokens count against fit: each turn adds its tool result
     and a short assistant note, while reasoning tokens cost wall time but
-    are never resent. The verdict turn's full output cap must still fit
-    under the configured context on top of the final prompt.
+    are not resent, except under preserve_reasoning, which reserves a
+    session turn's cap per step (a conversation turn can exceed it). The
+    verdict turn's full output cap must still fit under the configured
+    context on top of the final prompt.
     """
     budget = context * DEEP_CONTEXT_NUMERATOR // DEEP_CONTEXT_DENOMINATOR
-    per_step = settings.conv_tool_tokens + CONV_NOTE_RESERVE
+    per_step = _resent_per_step(settings)
     fitting = (budget - settings.conv_evidence_tokens) // per_step
     steps = max(1, min(settings.conv_max_steps, fitting))
     while steps > 1 and (
@@ -1107,9 +1127,13 @@ def _run_conversation(
             recalled = _recalled(final_text, findings)
             break
         # Reasoning fields are not resent: production clients resend
-        # message content and tool calls only.
+        # message content and tool calls only, unless the model's card
+        # requires the reasoning back (preserve_reasoning).
+        reasoning = message.get("reasoning") or message.get("reasoning_content")
         messages.append({
             "role": "assistant",
+            **({"reasoning": reasoning}
+               if settings.preserve_reasoning and reasoning else {}),
             "content": message.get("content") or "",
             "tool_calls": tool_calls,
         })
@@ -1246,8 +1270,10 @@ def _session_call(
         ),
         "reasoning_chars": response["reasoning_chars"],
         "tool_calls": response["tool_calls"],
-        # Popped by the caller: only the report's text is judged.
+        # Popped by the caller: only the report's text is judged, and the
+        # reasoning is resent only under preserve_reasoning.
         "content": response["choices"][0]["message"].get("content") or "",
+        "reasoning": response["reasoning_text"],
     }
 
 
@@ -1278,6 +1304,7 @@ def _session_once(
     for turn, name in enumerate(files):
         row = _session_call(chat, messages, SESSION_TURN_TOKENS, settings)
         del row["content"]
+        reasoning = row.pop("reasoning")
         per_step.append({"step": turn + 1, **row})
         # Nine alphanumerics, the id shape Mistral's tokenizer requires of
         # every tool call in the history; vLLM shortens longer ids to it but
@@ -1286,6 +1313,10 @@ def _session_once(
         messages.append({
             "role": "assistant",
             "content": SESSION_NOTE,
+            # The model's own reasoning for this step, ahead of the scripted
+            # note and call, when its card requires it in the history.
+            **({"reasoning": reasoning}
+               if settings.preserve_reasoning and reasoning else {}),
             "tool_calls": [{
                 "id": call_id,
                 "type": "function",
@@ -1301,6 +1332,7 @@ def _session_once(
     messages.append({"role": "user", "content": SESSION_REPORT_REQUEST})
     report = _session_call(chat, messages, SESSION_REPORT_TOKENS, settings)
     report_text = report.pop("content")
+    del report["reasoning"]
     recalled = _recalled(report_text, findings)
     total = time.monotonic() - started
     calls = per_step + [report]
@@ -1538,9 +1570,11 @@ def _measure_sessions(
             ),
         }
     one = results["1"]["sessions_per_hour"]["median"]
+    optimal = _operating_point(results)
     return {
         "steps": conversation_steps(context, settings),
         "by_streams": results,
+        "optimal_streams": optimal,
         "scaling_vs_1x": {
             stream_count: (
                 result["sessions_per_hour"]["median"] / one if one else 0
@@ -1548,6 +1582,21 @@ def _measure_sessions(
             for stream_count, result in results.items()
         },
     }
+
+
+def _operating_point(by_streams: dict) -> int | None:
+    """Every measured stream count is a candidate operating point: one whose
+    sessions all completed qualifies, and the fastest of those is optimal."""
+    complete = [
+        section for section in by_streams.values()
+        if not section["sessions_incomplete"]
+    ]
+    optimal = max(
+        complete,
+        key=lambda section: section["sessions_per_hour"]["median"],
+        default=None,
+    )
+    return optimal["streams"] if optimal else None
 
 
 def _mean_sd(values: list[float]) -> dict:
@@ -1895,6 +1944,13 @@ def _summary_lines(result: dict) -> list[str]:
         lines.append(
             "  decode rates are per stream; sessions/h is the production metric"
         )
+        if "optimal_streams" in session:
+            optimal = session["optimal_streams"]
+            lines.append(
+                f"  optimal operating point: {optimal}x"
+                if optimal
+                else "  no stream count completed every session"
+            )
         totals = {
             key: sum(
                 section[key] for section in session["by_streams"].values()
@@ -2252,10 +2308,7 @@ def run_benchmark(
         openai_chat, calibration, context, settings,
         tuple(plan["session"]["streams"]),
     )
-    if any(
-        section["sessions_incomplete"]
-        for section in result["audit_session"]["by_streams"].values()
-    ):
+    if result["audit_session"]["optimal_streams"] is None:
         result["publishable"] = False
         result["publication_reasons"].append("incomplete_sessions")
     _emit(result, output_format)

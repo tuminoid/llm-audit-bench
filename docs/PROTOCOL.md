@@ -104,6 +104,17 @@ permitted configuration, not a workload change:
 - The setting is recorded in the run's JSON settings and stated in the
   benchmark document entry. It does not mark the run `canonical: false`.
 
+A model whose card requires its prior reasoning back in the history
+(interleaved thinking: the template re-renders each past turn's reasoning,
+and the model stops reasoning when it is dropped) declares
+`AUDIT_BENCH_PRESERVE_REASONING=1`. The harness then resends each
+assistant turn's streamed reasoning as `reasoning` on that message: in the
+session, ahead of the scripted note and call; in the conversation, with the
+model's own turn. The resent reasoning grows the prefix, so the session
+reserves a turn's 2,048-token cap per step and may fit fewer steps. Recorded
+as `settings.preserve_reasoning`, with the same standing as the controls
+above.
+
 ### Off-by-one token accounting
 
 Some servers report `completion_tokens` one lower than they decoded when the
@@ -138,10 +149,17 @@ from publication readiness:
   therefore run a canonical experiment without being mislabeled as a retained
   result.
 - A measured run is also unpublishable when the model did not do the work:
-  `incomplete_sessions` when any session report hit its cap or named
-  fewer than 7/8 of its findings, `noncompliant_conversation` when the
+  `incomplete_sessions` when no measured stream count completed every
+  session (a session is incomplete when its report hit its cap or named
+  fewer than 7/8 of its findings), `noncompliant_conversation` when the
   conversation profile was not compliant. A throughput number for work
   that would be redone live is not a serving result.
+- Each measured stream count is a candidate operating point, and one
+  stream qualifies as much as N. Of the stream counts whose sessions all
+  completed, the fastest by median sessions/hour is
+  `audit_session.optimal_streams`, the operating point a result
+  publishes. A stream count with an incomplete session is reported but
+  never published as a serving rate.
 
 The adapter hashes the files it actually executes, including deployed copies
 on remote hosts. Runtime profiles retain both parsed fields and the original
@@ -251,7 +269,8 @@ The report is judged, because it is the session's deliverable. A session is
 complete when the report ends on its own, not at its cap, and names at least
 7/8 of the `FINDING:` tokens the chain carried: one omission in a 16-finding
 report is an edit in a live audit, a short report is a redo. Incomplete
-sessions are counted per stream count and make the run unpublishable. Three
+sessions are counted per stream count; a stream count with one is never
+published, and a run with no complete stream count is unpublishable. Three
 call-level facts are counted without gating: calls that hit their cap (long
 thinking and a runaway both end there, and the count is the evidence), turns
 that ended with neither text nor a tool call, and calls that streamed no
@@ -353,7 +372,7 @@ tokens, and the median cached-token fraction from the server's own
 every turn before the verdict makes at least one tool call, every file is
 read within `steps + 4` turns, and the verdict turn returns non-empty text
 with no tool calls. Reasoning fields are not resent, matching production
-clients.
+clients, except under `AUDIT_BENCH_PRESERVE_REASONING` (above).
 
 When reading a non-compliant sample, its `per_step` records say exactly
 which deviation happened -- check the last turn before concluding anything:
@@ -508,3 +527,27 @@ stays `audit-v2`.
   `call{turn:03d}{index:02d}` for the conversation's fallback), the shape
   vLLM's Mistral tokenizer requires of every id in the history; `call_001`
   failed every Mistral Small 4 session on its first resent step.
+
+## Amendment: 2.3.0 (2026-10-22)
+
+The publication rule picks the optimal operating point instead of requiring
+every stream count to complete. On a host where concurrency adds little,
+such as the M5 Max, a model can complete every session at one stream yet
+drop one at four; 2.2.0 then rejected the whole run, discarding the faster
+and complete 1x measurement. A run is now publishable when at least one
+measured stream count completed every session, and it publishes the
+fastest such count (`optimal_streams`, `SCHEMA_VERSION` 8). The workload,
+its settings and every measured rate are unchanged, so 2.2.0 and 2.3.0
+rates compare; `PROTOCOL` stays `audit-v2`. A 2.2.0 result rejected only for
+`incomplete_sessions` that has a complete stream count qualifies under this
+rule from its retained `by_streams`.
+
+2.3.0 also adds `AUDIT_BENCH_PRESERVE_REASONING` (see "Model-documented
+controls"), off by default: a model whose template re-renders every past
+turn's reasoning reads dropped turns as empty thoughts and stops reasoning.
+Laguna-XS streamed no reasoning on 237 of 255 session calls without it and
+on 1 of 255 with it. Runs without the control are unchanged.
+
+Capability Check v2 makes its `json_schema` check advisory in the same
+release and gives its workflow task the same reasoning control (see
+`docs/CAPABILITY.md`, `SCHEMA_VERSION` 6).

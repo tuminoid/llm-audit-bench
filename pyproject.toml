@@ -1,6 +1,6 @@
 [project]
 name = "llm-audit-bench"
-version = "2.2.0"
+version = "2.3.0"
 description = "AuditBench v2 serving benchmark and Capability Check v2 model gate for OpenAI-compatible LLM endpoints"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -13,6 +13,7 @@ import urllib.error
 from unittest import mock
 
 from audit_bench import (
+    SESSION_NOTE,
     SESSION_REPORT_REQUEST,
     SESSION_REPORT_TOKENS,
     SESSION_TURN_TOKENS,
@@ -25,6 +26,7 @@ from audit_bench import (
     _measure_conversations,
     _measure_capacity,
     _measure_sessions,
+    _operating_point,
     _output_dir,
     _publication_status,
     audit_prompt,
@@ -119,6 +121,7 @@ def _fake_session_chat(requests: list, completion: int = 40):
             "usage": usage,
             "timing": {"first_token_seconds": 0.5, "total_seconds": 1.5},
             "reasoning_chars": 12,
+            "reasoning_text": "step thought",
             "tool_calls": 0 if report else 1,
         }
 
@@ -439,6 +442,41 @@ class AuditBenchTest(unittest.TestCase):
             "file_001",
         )
         self.assertIn("file_001", report_messages[3]["content"])
+        self.assertNotIn("reasoning", scripted)
+
+    def test_session_resends_reasoning_only_when_preserved(self):
+        requests: list = []
+        with contextlib.redirect_stdout(io.StringIO()):
+            _measure_sessions(
+                _fake_session_chat(requests), CALIBRATION, 131072,
+                self._session_settings(preserve_reasoning=True), (1,),
+            )
+        report_messages = requests[3]["messages"]
+        scripted = [m for m in report_messages if m["role"] == "assistant"]
+        self.assertEqual(len(scripted), 3)
+        for message in scripted:
+            self.assertEqual(message["reasoning"], "step thought")
+            self.assertEqual(message["content"], SESSION_NOTE)
+
+    def test_preserved_reasoning_reserves_a_turn_cap_per_step(self):
+        kept = dataclasses.replace(settings(), preserve_reasoning=True)
+        # 256k still fits the 16-step chain with the reserve; 128k does not.
+        self.assertEqual(
+            build_plan(262144, kept, 8, 2748350)["session"]["steps"], 16
+        )
+        self.assertEqual(
+            build_plan(131072, settings(), 2, 285696)["session"]["steps"], 9
+        )
+        self.assertLess(
+            build_plan(131072, kept, 2, 285696)["session"]["steps"], 9
+        )
+        # Admission sizes each stream with the same reserve.
+        plain = build_plan(262144, settings(), 8, 2748350)["session"]
+        resent = build_plan(262144, kept, 8, 2748350)["session"]
+        self.assertEqual(
+            resent["per_stream_kv_demand"] - plain["per_stream_kv_demand"],
+            16 * 2048,
+        )
 
     def test_session_flags_an_empty_report_without_padding(self):
         def silent(messages, tools, max_tokens, sampling=None, stream=False):
@@ -561,6 +599,7 @@ class AuditBenchTest(unittest.TestCase):
         self.assertEqual(len(two["samples"][0]["per_stream"]), 2)
         self.assertGreater(two["sessions_per_hour"]["median"], 0)
         self.assertIn("2", measured["scaling_vs_1x"])
+        self.assertIn(measured["optimal_streams"], (1, 2))
         steps_a, evidence_a, _, files_a = _conversation_fixture(
             CALIBRATION, 131072, self._session_settings(), 900000, 901000
         )
@@ -782,7 +821,7 @@ class AuditBenchTest(unittest.TestCase):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
         self.assertEqual(result, 0)
         report = json.loads(text.splitlines()[-1])
-        self.assertEqual(report["schema_version"], 7)
+        self.assertEqual(report["schema_version"], 8)
         self.assertEqual(report["protocol"], "audit-v2")
         self.assertFalse(report["publishable"])
         self.assertEqual(
@@ -812,6 +851,27 @@ class AuditBenchTest(unittest.TestCase):
         )
         self.assertIn("1 session incomplete", summary)
         self.assertIn("3 calls hit the output cap", summary)
+        self.assertIn("no stream count completed every session", summary)
+
+    def test_operating_point_is_the_fastest_complete_stream_count(self):
+        def section(streams, rate, incomplete):
+            return {"streams": streams, "sessions_incomplete": incomplete,
+                    "sessions_per_hour": {"median": rate}}
+
+        # 1x qualifies on its own when 4x drops a session, even though 4x
+        # measured faster; the faster complete count wins otherwise.
+        self.assertEqual(
+            _operating_point({"1": section(1, 20.3, 0), "4": section(4, 21.0, 2)}),
+            1,
+        )
+        self.assertEqual(
+            _operating_point({"1": section(1, 8.0, 0), "4": section(4, 8.7, 0)}),
+            4,
+        )
+        self.assertEqual(
+            _operating_point({"1": section(1, 8.0, 1), "4": section(4, 8.7, 1)}),
+            None,
+        )
 
     def test_noncompliant_conversation_is_unpublishable(self):
         # The session fake never calls a tool, so the model-driven loop
@@ -879,7 +939,7 @@ class AuditBenchTest(unittest.TestCase):
             self.assertEqual(len(retained), 1)
             self.assertIn(f"json: {retained[0]}", text)
             report = json.loads(retained[0].read_text(encoding="utf-8"))
-        self.assertEqual(report["schema_version"], 7)
+        self.assertEqual(report["schema_version"], 8)
         self.assertEqual(report["artifact_path"], str(retained[0]))
         self.assertIn("audit_session", report)
 
@@ -1051,6 +1111,7 @@ class AuditBenchTest(unittest.TestCase):
         self.assertEqual(body["choices"][0]["finish_reason"], "stop")
         self.assertEqual(body["choices"][0]["message"]["content"], "report")
         self.assertEqual((body["reasoning_chars"], body["tool_calls"]), (5, 0))
+        self.assertEqual(body["reasoning_text"], "think")
         timing = body["timing"]
         self.assertIsNotNone(timing["first_token_seconds"])
         self.assertLessEqual(
