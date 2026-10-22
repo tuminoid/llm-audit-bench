@@ -29,7 +29,9 @@ PROTOCOL = "capability-v2"
 # v1 reports carry the same shape without the audit fitness check; they
 # stay listable and readable as history.
 LEGACY_PROTOCOLS = ("capability-v1",)
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+# Checks recorded with their status that never decide the verdict.
+ADVISORY_CHECKS = ("json_schema",)
 TOOL_NAME = "lookup_issue"
 TOOL_SENTINEL = "sentinel-cobalt"
 # Schema enforcement is a server property: constrained decoding masks
@@ -246,6 +248,10 @@ class CapabilityConfig:
     # Requests the server admits at once. Audit fitness never submits more,
     # so a sample never waits in a queue past the request timeout.
     concurrency: int = 1
+    # A model whose card requires its prior reasoning in the history
+    # (interleaved thinking) gets it resent in the workflow task's tool loop,
+    # as AUDIT_BENCH_PRESERVE_REASONING does in AuditBench.
+    preserve_reasoning: bool = False
 
     def validate(self) -> None:
         if self.reasoning not in {"required", "absent"}:
@@ -264,6 +270,7 @@ class CapabilityConfig:
             "system_prompt": self.system_prompt,
             "sampling": self.sampling,
             "concurrency": self.concurrency,
+            "preserve_reasoning": self.preserve_reasoning,
         }
 
 
@@ -417,6 +424,9 @@ def _normalize_openai_reasoning(result: ChatResult) -> ChatResult:
 
 
 class OpenAIChatAdapter:
+    # The assistant-message field that carries resent reasoning.
+    reasoning_field = "reasoning"
+
     def __init__(self, base_url: str, model: str, timeout: int):
         self.url = f"{base_url.rstrip('/')}/v1/chat/completions"
         self.model = model
@@ -585,6 +595,8 @@ class OpenAIChatAdapter:
 
 
 class OllamaChatAdapter:
+    reasoning_field = "thinking"
+
     def __init__(self, base_url: str, model: str, timeout: int):
         self.url = f"{base_url.rstrip('/')}/api/chat"
         self.model = model
@@ -1590,7 +1602,10 @@ def _workflow_sample(adapter, config) -> dict:
                     failure = ("instruction", "final reply was not DONE: "
                                f"{result.content[:120]!r}")
                 break
-            messages.append(adapter.assistant_message(result))
+            message = adapter.assistant_message(result)
+            if config.preserve_reasoning and result.reasoning:
+                message[adapter.reasoning_field] = result.reasoning
+            messages.append(message)
             for call in result.tool_calls:
                 args = call.arguments
                 if call.name == "list_files":
@@ -1850,7 +1865,11 @@ def _summary_lines(report: dict) -> list[str]:
     ]
     enforcement = (checks.get("json_schema") or {}).get("enforcement")
     if enforcement:
-        notes.append(f"  schema enforcement: {enforcement}")
+        notes.append(
+            f"  schema enforcement: {enforcement}"
+            + (" (advisory, not gating)"
+               if "json_schema" in report.get("advisory_failures", ()) else "")
+        )
     unaided = (checks.get("structured_json") or {}).get("unaided")
     if unaided:
         notes.append(f"  unaided document: {unaided}")
@@ -2252,7 +2271,14 @@ def run_capability_check(
             lambda: (run_audit_fitness(adapter, config, fitness_samples), None),
         )
 
-    failed = [name for name, check in checks.items() if check["status"] == "failed"]
+    failed = [
+        name for name, check in checks.items()
+        if check["status"] == "failed" and name not in ADVISORY_CHECKS
+    ]
+    advisory = [
+        name for name in ADVISORY_CHECKS
+        if (checks.get(name) or {}).get("status") == "failed"
+    ]
     report = {
         "schema_version": SCHEMA_VERSION,
         "protocol": PROTOCOL,
@@ -2265,6 +2291,7 @@ def run_capability_check(
         "identity": identity,
         "checks": checks,
         "failed_checks": failed,
+        "advisory_failures": advisory,
     }
     _emit(report, output_format)
     return 1 if failed else 0
@@ -2406,6 +2433,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--preserve-reasoning",
+        action="store_true",
+        default=os.environ.get("CAPABILITY_PRESERVE_REASONING", "0") == "1",
+        help=(
+            "resend each turn's reasoning in the workflow task's history, for "
+            "models whose card requires it (default CAPABILITY_PRESERVE_"
+            "REASONING=1)"
+        ),
+    )
+    parser.add_argument(
         "--fitness-concurrency",
         type=int,
         default=1,
@@ -2489,6 +2526,7 @@ def main(argv: list[str] | None = None) -> int:
             system_prompt=args.system_prompt,
             sampling=parse_sampling(args.sampling),
             concurrency=args.fitness_concurrency,
+            preserve_reasoning=args.preserve_reasoning,
         )
         tokens = int(os.environ.get("CAPABILITY_REASONING_TOKENS", "2048"))
         return run_capability_check(

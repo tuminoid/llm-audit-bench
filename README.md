@@ -12,9 +12,9 @@ workloads. Two instruments, one target: any OpenAI-compatible endpoint.
 - **Capability Check v2** (`capability-check`) is the pass/fail model gate:
   streaming reasoning, thinking-disabled control, tool calls in
   non-streaming and streaming modes, tool round trip, structured JSON with a
-  measured unaided document, whether the server enforces a JSON schema or
-  admits it cannot, and audit fitness: audit-shaped tasks at the declared
-  sampling, judged against ground truth. Spec:
+  measured unaided document, and audit fitness: audit-shaped tasks at the
+  declared sampling, judged against ground truth. It also records, without
+  gating, whether the server enforces a JSON schema or admits it cannot. Spec:
   [docs/CAPABILITY.md](docs/CAPABILITY.md).
 
 AuditBench does not score answer quality, and audit fitness never ranks

@@ -540,7 +540,7 @@ class CapabilityCheckTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(artifacts), 1)
         report = json.loads(text)
-        self.assertEqual(report["schema_version"], 5)
+        self.assertEqual(report["schema_version"], 6)
         self.assertEqual(report["protocol"], "capability-v2")
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["failed_checks"], [])
@@ -683,14 +683,16 @@ class CapabilityCheckTest(unittest.TestCase):
             self.assertEqual(report["checks"][passed]["status"], "passed")
             self.assertEqual(report["failed_checks"], [failed])
 
-    def test_enforcement_modes_are_recorded_and_only_lying_fails(self):
+    def test_enforcement_modes_are_recorded_and_never_gate(self):
+        # A lying endpoint fails the check, which is advisory: the verdict
+        # and exit code stay passed.
         cases = {
             FakeAdapter: ("passed", "enforced", 0),
             RejectingAdapter: ("passed", "unsupported", 0),
-            UnenforcingAdapter: ("failed", "ignored", 1),
-            JsonOnlyAdapter: ("failed", "json_only", 1),
-            TruncatingAdapter: ("failed", "truncated", 1),
-            WhitespaceRunawayAdapter: ("failed", "whitespace_runaway", 1),
+            UnenforcingAdapter: ("failed", "ignored", 0),
+            JsonOnlyAdapter: ("failed", "json_only", 0),
+            TruncatingAdapter: ("failed", "truncated", 0),
+            WhitespaceRunawayAdapter: ("failed", "whitespace_runaway", 0),
         }
         for adapter_class, (status, enforcement, code) in cases.items():
             with self.subTest(adapter=adapter_class.__name__):
@@ -719,6 +721,12 @@ class CapabilityCheckTest(unittest.TestCase):
                 check = report["checks"]["json_schema"]
                 self.assertEqual(result, code)
                 self.assertEqual(check["status"], status)
+                self.assertEqual(report["status"], "passed")
+                self.assertNotIn("json_schema", report["failed_checks"])
+                self.assertEqual(
+                    report["advisory_failures"],
+                    ["json_schema"] if status == "failed" else [],
+                )
                 # The mode is retained even when the check failed.
                 self.assertEqual(check["enforcement"], enforcement)
                 if enforcement == "unsupported":
@@ -1190,6 +1198,8 @@ def _call(name, **arguments):
 class FitnessFake(FakeAdapter):
     """A healthy audit model; subclasses break one behavior at a time."""
 
+    reasoning_field = "reasoning"
+
     def __init__(self):
         self.sampling = []
 
@@ -1270,6 +1280,28 @@ class AuditFitnessTest(unittest.TestCase):
         self.assertTrue(all(s == {"temperature": 0.6} for s in adapter.sampling))
         workflow = evidence["tasks"]["workflow"]["samples"][0]
         self.assertEqual(workflow["files_read"], ["app/db.py", "app/routes.py"])
+
+    def test_workflow_resends_reasoning_only_when_preserved(self):
+        class Recording(FitnessFake):
+            def chat(self, messages, **kwargs):
+                if "Audit billing-api" in str(messages[0].get("content", "")):
+                    self.last = [dict(message) for message in messages]
+                return super().chat(messages, **kwargs)
+
+        cases = (("reasoning", False, None), ("reasoning", True, "plan"),
+                 (capability_check.OllamaChatAdapter.reasoning_field, True,
+                  "plan"))
+        for field, preserve, expected in cases:
+            with self.subTest(field=field, preserve=preserve):
+                adapter = Recording()
+                adapter.reasoning_field = field
+                config = CapabilityConfig(
+                    reasoning="required", tools="required",
+                    sampling={"temperature": 0.6}, preserve_reasoning=preserve,
+                )
+                self._fitness(adapter, config, samples=1)
+                first = next(m for m in adapter.last if m["role"] == "assistant")
+                self.assertEqual(first.get(field), expected)
 
     def test_tools_absent_model_skips_the_workflow(self):
         config = CapabilityConfig(

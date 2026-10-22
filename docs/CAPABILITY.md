@@ -23,7 +23,7 @@ The protocol uses fixed local fixtures:
 | Streaming tool call | With automatic tool choice, one streamed `lookup_issue` call is assembled with `{"issue_number": 42}` |
 | Tool round trip | The model consumes the returned `sentinel-cobalt` value and finishes without another tool call |
 | Structured JSON | The final content is the exact requested JSON object, without Markdown cleanup. The same check records, without gating, what the model manages when asked for the full fixture document with the schema stated in words (`unaided`) |
-| JSON schema | The endpoint is honest about schema enforcement: it either constrains decoding to the fixture schema, or refuses the parameter with a 4xx. Accepting it and returning anything else fails |
+| JSON schema | Advisory: recorded with its status, never decides the verdict. The endpoint is honest about schema enforcement: it either constrains decoding to the fixture schema, or refuses the parameter with a 4xx. Accepting it and returning anything else fails the check |
 | Audit fitness | Fewer than `FITNESS_FAILURE_LIMIT` (2) of the audit samples fail: three audit-shaped tasks (two for a model without tools), four samples each, at the declared sampling |
 
 The reasoning fixture allows enough output for models whose thought phase is
@@ -91,8 +91,9 @@ Its `enforcement` field names what happened, and is retained on failure too:
 | `truncated` | The response hit the token budget before closing the document, so nothing is proven | failed |
 
 A server without constrained decoding is not defective and passes by refusing
-the parameter; a server that accepts it and does not honor it fails, because
-callers would otherwise trust a guarantee that does not exist. The check runs
+the parameter; a server that accepts it and does not honor it fails the
+check, because callers would otherwise trust a guarantee that does not exist.
+The check is advisory: it never fails the gate. The check runs
 in the same mode as Structured JSON: the documented disable control when the
 model has one, the reasoning control otherwise.
 
@@ -202,7 +203,12 @@ Every model config (or standalone invocation, via `--reasoning`, `--tools`,
 - the documented control used to disable it, or `none` when unsupported;
   and
 - the checkpoint's sampling (`--sampling`, space-separated `key=value`), the
-  same declaration AuditBench uses.
+  same declaration AuditBench uses; and
+- whether its card requires prior reasoning back in the history
+  (`--preserve-reasoning`, or `CAPABILITY_PRESERVE_REASONING=1`): the
+  workflow task then resends each turn's reasoning on its assistant message
+  (`reasoning` on OpenAI-compatible servers, `thinking` on Ollama's native
+  API), as `AUDIT_BENCH_PRESERVE_REASONING` does in AuditBench.
 
 These are model facts. Do not infer them from parser names or manifest
 capability lists: manifests can omit working tools, and a configured reasoning
@@ -251,7 +257,7 @@ artifact into the results document:
 | Tool loop | `checks.tool_round_trip.status` |
 | JSON | `checks.structured_json.status` |
 | Unaided document | `checks.structured_json.unaided`: `valid`, `json_only`, `ignored`, `truncated`, or `error`; never gates |
-| Schema enforced | `checks.json_schema.enforcement`: `enforced` or `unsupported` pass; `json_only`, `ignored`, `whitespace_runaway`, and `truncated` fail |
+| Schema enforced | `checks.json_schema.enforcement`: `enforced` or `unsupported` pass; `json_only`, `ignored`, `whitespace_runaway`, and `truncated` fail the check; never gates (`advisory_failures`) |
 | Audit fitness | `checks.audit_fitness.status`, with `failed_samples` of `total_samples` and `failure_classes` |
 | Result | top-level `status` |
 | Model identity | Ollama manifest `identity.digest`, or Hugging Face `identity.revision` |
@@ -329,14 +335,24 @@ audit fitness at the default sample count. Its reasoning result must match
 the model-config expectation. A throughput result cannot override a
 capability failure.
 
-Schema enforcement is a host fact, not a model fact: `unsupported` says the
-server cannot constrain decoding, which promotes or blocks nothing by itself,
-while the failing values mean the endpoint misrepresents what it does. Record
-the mode with the host, and do not treat `enforced` as a substitute for the
-model's own structured-output result.
+Schema enforcement is a host fact, not a model fact, and it never decides
+the verdict: a failed `json_schema` check is listed in the report's
+`advisory_failures`, not in `failed_checks`. `unsupported` says the server
+cannot constrain decoding; the failing values mean the endpoint misrepresents
+what it does. Record the mode with the host, and do not treat `enforced` as a
+substitute for the model's own structured-output result.
 
 ## Amendments
 
+- **Schema enforcement advisory** (`SCHEMA_VERSION` 6). The `json_schema`
+  check runs and records its status and mode as before, but no longer
+  decides the verdict or the exit code: no audit client depends on
+  constrained decoding yet, and its failures are engine gaps rather than
+  model faults. A failed check is listed in `advisory_failures`. Every other
+  check and fixture is unchanged, so a report that failed only `json_schema`
+  under `SCHEMA_VERSION` 5 is a pass under this rule. The same version adds
+  the `preserve_reasoning` expectation for interleaved-thinking models; it
+  defaults off, which keeps every other model's workflow unchanged.
 - **Triage judged per flagged rule** (report shape unchanged,
   `SCHEMA_VERSION` 5). The triage prompt defined a true positive as
   "exploitable as written", which made the unsalted password hash (C05)
