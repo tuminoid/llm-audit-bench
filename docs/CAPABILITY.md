@@ -154,7 +154,7 @@ Every sample is first checked as a generation, in this order:
 | -- | -- |
 | `error` | The request failed, or its response could not be assembled (for example tool arguments that are not JSON) |
 | `incomplete` | The stream did not complete, or the workflow reached `FITNESS_MAX_TURNS` (24) |
-| `runaway` | The generation hit its cap: `FITNESS_TOKENS` (32,768) for a single answer, `FITNESS_TURN_TOKENS` (16,384) per workflow turn |
+| `runaway` | The generation hit its cap: a quarter of the served context for a single answer, at least `FITNESS_TOKENS` (32,768), and `FITNESS_TURN_TOKENS` (16,384) per workflow turn |
 | `leak` | A raw reasoning or tool marker appeared in content |
 | `no_reasoning` | A model expected to reason answered with an empty reasoning channel; in the workflow this applies to the opening turn, since interleaved thinking may skip short tool turns |
 
@@ -209,6 +209,10 @@ Every model config (or standalone invocation, via `--reasoning`, `--tools`,
   workflow task then resends each turn's reasoning on its assistant message
   (`reasoning` on OpenAI-compatible servers, `thinking` on Ollama's native
   API), as `AUDIT_BENCH_PRESERVE_REASONING` does in AuditBench.
+
+The served per-request context (`--context`) is a deployment fact, not a
+model fact; the single-answer fitness cap is a quarter of it, at least
+32,768, and without it the cap stays 32,768.
 
 These are model facts. Do not infer them from parser names or manifest
 capability lists: manifests can omit working tools, and a configured reasoning
@@ -344,6 +348,16 @@ substitute for the model's own structured-output result.
 
 ## Amendments
 
+- **Single-answer cap from the served context** (`SCHEMA_VERSION` 7). The
+  selection and triage cap is a quarter of the served per-request context,
+  the output budget audit clients give the model, and never below the old
+  fixed 32,768: 65,536 at 262,144. The 32,768 cap sat at half that budget,
+  so it failed a model that deliberates selection past it on topic
+  (Nanbeige 4.3: 9 of 12 at 32,768, 12 of 12 at 65,536, same build). Adapters
+  pass the context in the new `context` expectation; without it the cap stays
+  32,768. A pass under the old cap is a pass under the new one, and every
+  other check and fixture is unchanged, so earlier results stand; only a
+  `runaway` at the old cap could read differently on a rerun.
 - **Schema enforcement advisory** (`SCHEMA_VERSION` 6). The `json_schema`
   check runs and records its status and mode as before, but no longer
   decides the verdict or the exit code: no audit client depends on

@@ -29,7 +29,7 @@ PROTOCOL = "capability-v2"
 # v1 reports carry the same shape without the audit fitness check; they
 # stay listable and readable as history.
 LEGACY_PROTOCOLS = ("capability-v1",)
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 # Checks recorded with their status that never decide the verdict.
 ADVISORY_CHECKS = ("json_schema",)
 TOOL_NAME = "lookup_issue"
@@ -252,6 +252,9 @@ class CapabilityConfig:
     # (interleaved thinking) gets it resent in the workflow task's tool loop,
     # as AUDIT_BENCH_PRESERVE_REASONING does in AuditBench.
     preserve_reasoning: bool = False
+    # The served per-request context; the single-answer cap is a quarter of
+    # it, never below FITNESS_TOKENS (see answer_cap).
+    context: int | None = None
 
     def validate(self) -> None:
         if self.reasoning not in {"required", "absent"}:
@@ -271,6 +274,7 @@ class CapabilityConfig:
             "sampling": self.sampling,
             "concurrency": self.concurrency,
             "preserve_reasoning": self.preserve_reasoning,
+            "context": self.context,
         }
 
 
@@ -852,7 +856,9 @@ FITNESS_FAILURE_LIMIT = 2
 # the cap is a runaway, not a slow thinker. qwen3.6 selects in 8-12k
 # tokens; ornith 1.5 deliberates the recency rule topic by topic and
 # finished at 21k, while 24,576 cut off three samples a few hundred tokens
-# short of their answer.
+# short of their answer. The floor: the cap is a quarter of the served
+# context when that is larger, the output budget audit clients give the
+# model (Nanbeige 4.3 deliberates selection past 32k and passes at 65,536).
 FITNESS_TOKENS = 32768
 FITNESS_TURN_TOKENS = 16384
 FITNESS_MAX_TURNS = 24
@@ -1548,12 +1554,18 @@ def _sample_record(
     return record
 
 
+def answer_cap(config: CapabilityConfig) -> int:
+    """The single-answer token cap: a quarter of the served context, at
+    least FITNESS_TOKENS."""
+    return max(FITNESS_TOKENS, (config.context or 0) // 4)
+
+
 def _answer_sample(adapter, config, prompt, judge) -> dict:
     started = time.monotonic()
     try:
         result = adapter.chat(
             _messages(config, config.reasoning_prefix + prompt),
-            max_tokens=FITNESS_TOKENS,
+            max_tokens=answer_cap(config),
             stream=True,
             options=config.reasoning_options,
             sampling=config.sampling,
@@ -1697,7 +1709,7 @@ def run_audit_fitness(adapter, config: CapabilityConfig, samples: int) -> dict:
     evidence = {
         "samples_per_task": samples,
         "concurrency": workers,
-        "token_caps": {"answer": FITNESS_TOKENS, "turn": FITNESS_TURN_TOKENS},
+        "token_caps": {"answer": answer_cap(config), "turn": FITNESS_TURN_TOKENS},
         "failure_limit": FITNESS_FAILURE_LIMIT,
         "failed_samples": failed,
         "total_samples": samples * len(tasks),
@@ -2433,6 +2445,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--context",
+        type=int,
+        default=None,
+        help=(
+            "the served per-request context; the single-answer fitness cap "
+            "is a quarter of it, at least 32,768 tokens"
+        ),
+    )
+    parser.add_argument(
         "--preserve-reasoning",
         action="store_true",
         default=os.environ.get("CAPABILITY_PRESERVE_REASONING", "0") == "1",
@@ -2527,6 +2548,7 @@ def main(argv: list[str] | None = None) -> int:
             sampling=parse_sampling(args.sampling),
             concurrency=args.fitness_concurrency,
             preserve_reasoning=args.preserve_reasoning,
+            context=args.context,
         )
         tokens = int(os.environ.get("CAPABILITY_REASONING_TOKENS", "2048"))
         return run_capability_check(

@@ -540,7 +540,7 @@ class CapabilityCheckTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(artifacts), 1)
         report = json.loads(text)
-        self.assertEqual(report["schema_version"], 6)
+        self.assertEqual(report["schema_version"], 7)
         self.assertEqual(report["protocol"], "capability-v2")
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["failed_checks"], [])
@@ -1302,6 +1302,27 @@ class AuditFitnessTest(unittest.TestCase):
                 self._fitness(adapter, config, samples=1)
                 first = next(m for m in adapter.last if m["role"] == "assistant")
                 self.assertEqual(first.get(field), expected)
+
+    def test_answer_cap_is_a_quarter_of_the_context_at_least_32k(self):
+        class Recording(FitnessFake):
+            def chat(self, messages, *, max_tokens, **kwargs):
+                if "Select Security-Relevant" in str(messages[0].get("content", "")):
+                    self.caps.append(max_tokens)
+                return super().chat(messages, max_tokens=max_tokens, **kwargs)
+
+        cases = ((None, 32768), (65536, 32768), (131072, 32768),
+                 (262144, 65536), (524288, 131072))
+        for context, expected in cases:
+            with self.subTest(context=context):
+                adapter = Recording()
+                adapter.caps = []
+                config = CapabilityConfig(
+                    reasoning="required", tools="required",
+                    sampling={"temperature": 0.6}, context=context,
+                )
+                evidence = self._fitness(adapter, config, samples=1)
+                self.assertEqual(adapter.caps, [expected])
+                self.assertEqual(evidence["token_caps"]["answer"], expected)
 
     def test_tools_absent_model_skips_the_workflow(self):
         config = CapabilityConfig(
