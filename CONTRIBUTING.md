@@ -91,5 +91,5 @@ amendment note.
 
 Measured results, campaign records, host inventories, hostnames or
 hardware details of real machines, runtime launchers, and model
-configurations. Those live in the private serving-configuration
-repositories that consume this one.
+configurations. Those live in the serving-configuration repositories
+that consume this one.

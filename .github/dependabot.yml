@@ -1,0 +1,27 @@
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+- package-ecosystem: "github-actions"
+  directory: "/" # Location of package manifests
+  schedule:
+    interval: "monthly"
+  target-branch: main
+  ## group all action bumps into single PR
+  groups:
+    github-actions:
+      patterns: [ "*" ]
+  ignore:
+  # Ignore major bumps, as they break the group bump process
+  - dependency-name: "*"
+    update-types: [ "version-update:semver-major" ]
+  cooldown:
+    default-days: 7
+- package-ecosystem: "npm"
+  directory: "/" # Location of package manifests
+  schedule:
+    interval: "weekly"
+  target-branch: main
+  cooldown:
+    default-days: 7

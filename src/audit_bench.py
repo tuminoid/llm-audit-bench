@@ -1077,8 +1077,8 @@ def _run_conversation(
     must drive the tool loop and stop with a verdict, so non-compliance
     here means the model deviated from the fixture protocol -- it says
     nothing about server performance, which the session profile measures
-    without depending on the model's cooperation. Mirrors the production
-    secaudit client: every turn resends the whole conversation, the
+    without depending on the model's cooperation. Mirrors a production
+    audit client: every turn resends the whole conversation, the
     harness answers every tool call the model makes (one or several per
     turn), and the final turn is a plain-text verdict at depth.
     """
