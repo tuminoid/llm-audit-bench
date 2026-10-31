@@ -32,8 +32,11 @@ PROTOCOL = "audit-v2"
 # the last harness commit that renders them instead of guessing.
 LEGACY_PROTOCOL = "audit-v1"
 LEGACY_HARNESS_COMMIT = "382760d"
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_STREAMS = (1, 2, 4, 8)
+# The session climbs the stream ladder only while a rung completes every
+# session and gains at least this much over the rung below it.
+DEFAULT_STREAM_GAIN = 0.10
 DEFAULT_SAMPLES = 3
 DEFAULT_MIN_SAMPLES = 2
 DEFAULT_SAMPLE_AGREEMENT = 0.05
@@ -263,6 +266,7 @@ class Settings:
     dry_run: bool
     min_samples: int = DEFAULT_MIN_SAMPLES
     sample_agreement: float = DEFAULT_SAMPLE_AGREEMENT
+    stream_gain: float = DEFAULT_STREAM_GAIN
     conv_evidence_tokens: int = DEFAULT_CONV_EVIDENCE_TOKENS
     conv_tool_tokens: int = DEFAULT_CONV_TOOL_TOKENS
     conv_output_tokens: int = DEFAULT_CONV_OUTPUT_TOKENS
@@ -317,6 +321,19 @@ class Settings:
             raise ValueError(
                 "AUDIT_BENCH_SAMPLE_AGREEMENT must be above 0 and at most 0.5"
             )
+        gain_raw = os.environ.get(
+            "AUDIT_BENCH_STREAM_GAIN", str(DEFAULT_STREAM_GAIN)
+        )
+        try:
+            stream_gain = float(gain_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"AUDIT_BENCH_STREAM_GAIN must be numeric, got {gain_raw}"
+            ) from exc
+        if not 0 <= stream_gain < 1:
+            raise ValueError(
+                "AUDIT_BENCH_STREAM_GAIN must be at least 0 and below 1"
+            )
         conv_evidence = _positive_int(
             "AUDIT_BENCH_CONV_EVIDENCE", DEFAULT_CONV_EVIDENCE_TOKENS
         )
@@ -340,6 +357,7 @@ class Settings:
             samples=samples,
             min_samples=min_samples,
             sample_agreement=sample_agreement,
+            stream_gain=stream_gain,
             conv_evidence_tokens=conv_evidence,
             conv_tool_tokens=conv_tool,
             conv_output_tokens=conv_output,
@@ -386,6 +404,7 @@ class Settings:
             and self.samples == DEFAULT_SAMPLES
             and self.min_samples == DEFAULT_MIN_SAMPLES
             and self.sample_agreement == DEFAULT_SAMPLE_AGREEMENT
+            and self.stream_gain == DEFAULT_STREAM_GAIN
             and self.tolerance == DEFAULT_TOLERANCE
             and "temperature" in self.sampling
             and not self.tolerate_off_by_one
@@ -425,7 +444,7 @@ def _session_streams(
     active_slots: int,
     kv_pool_tokens: int,
 ) -> tuple[int, list[int]]:
-    """Session stream counts (1x and the largest fitting) and the demand.
+    """Session stream ladder (every fitting candidate) and the demand.
 
     Demand is the final resent conversation plus the report cap. No
     shared-prefix credit is taken even though concurrent sessions share
@@ -444,7 +463,7 @@ def _session_streams(
     fitting = [
         candidate for candidate in settings.streams if candidate <= max_streams
     ]
-    return per_stream, _endpoints(fitting or [1])
+    return per_stream, fitting or [1]
 
 
 def build_plan(
@@ -1506,81 +1525,107 @@ def _measure_sessions(
     settings: Settings,
     streams: tuple[int, ...],
 ) -> dict:
-    """Session family over the planned stream counts."""
-    rows: dict[int, list[dict]] = {count: [] for count in streams}
+    """Session family up the planned stream ladder.
 
-    def _run_pass(sample_index: int) -> None:
-        order = streams if sample_index % 2 == 0 else tuple(reversed(streams))
-        for stream_count in order:
-            rows[stream_count].append(
-                _run_session_batch(
-                    chat, calibration, context, settings,
-                    stream_count, sample_index,
-                )
+    Each rung runs its own samples. The next rung runs only when this one
+    completed every session and, above 1x, gained at least the stream gain
+    over the rung below: a rung that dropped a session is no baseline, and
+    concurrency that stopped paying is not worth the memory it holds.
+    """
+    results: dict[str, dict] = {}
+    stop_reason = "ladder_top"
+    for stream_count in streams:
+        section = _measure_stream_count(
+            chat, calibration, context, settings, stream_count
+        )
+        below = results.get(str(_rung_below(streams, stream_count)))
+        results[str(stream_count)] = section
+        if section["sessions_incomplete"]:
+            stop_reason = "incomplete_sessions"
+            break
+        rate = section["sessions_per_hour"]["median"]
+        if below and rate < below["sessions_per_hour"]["median"] * (
+            1 + settings.stream_gain
+        ):
+            stop_reason = "gain_below_threshold"
+            break
+    if len(results) < len(streams):
+        print(f"  session          ladder stops at {stream_count}x: {stop_reason}")
+    one = results["1"]["sessions_per_hour"]["median"]
+    return {
+        "steps": conversation_steps(context, settings),
+        "by_streams": results,
+        "optimal_streams": _operating_point(results),
+        "ladder_stop": stop_reason,
+        "scaling_vs_1x": {
+            count: (
+                result["sessions_per_hour"]["median"] / one if one else 0
             )
+            for count, result in results.items()
+        },
+    }
 
+
+def _rung_below(streams: tuple[int, ...], stream_count: int) -> int | None:
+    index = streams.index(stream_count)
+    return streams[index - 1] if index else None
+
+
+def _measure_stream_count(
+    chat: Callable,
+    calibration: "Calibration",
+    context: int,
+    settings: Settings,
+    stream_count: int,
+) -> dict:
+    """One rung: adaptive samples at one stream count, then its summary."""
+    batch: list[dict] = []
     passes = min(settings.min_samples, settings.samples)
     for sample_index in range(passes):
-        _run_pass(sample_index)
-    # A full extra pass keeps the alternating stream order symmetric, so
-    # a single disagreeing stream count extends every count.
-    while passes < settings.samples and any(
-        not _rates_agree(rows[count], settings.sample_agreement)
-        for count in streams
+        batch.append(_run_session_batch(
+            chat, calibration, context, settings, stream_count, sample_index,
+        ))
+    while passes < settings.samples and not _rates_agree(
+        batch, settings.sample_agreement
     ):
         print(
             f"  session          samples disagree beyond "
             f"{settings.sample_agreement:.0%}; extending"
         )
-        _run_pass(passes)
+        batch.append(_run_session_batch(
+            chat, calibration, context, settings, stream_count, passes,
+        ))
         passes += 1
-
-    results = {}
-    for stream_count in streams:
-        batch = rows[stream_count]
-        results[str(stream_count)] = {
-            "streams": stream_count,
-            "samples": batch,
-            "wall_seconds": _median_range(batch, "wall_seconds"),
-            "sessions_per_hour": _median_range(batch, "sessions_per_hour"),
-            "output_tokens_per_session": statistics.median(
-                [row["output_tokens_per_session"] for row in batch]
-            ),
-            "prefill_tokens_per_second": _median_known(
-                [row["prefill_tokens_per_second"] for row in batch]
-            ),
-            "report_decode_tokens_per_second": _median_known(
-                [row["report_decode_tokens_per_second"] for row in batch]
-            ),
-            "turn_decode_tokens_per_second": {
-                position: _median_known([
-                    row["turn_decode_tokens_per_second"][position]
-                    for row in batch
-                ])
-                for position in ("first", "middle", "last")
-            },
-            "sessions": sum(row["streams"] for row in batch),
-            **{
-                key: sum(row[key] for row in batch)
-                for key in ("sessions_incomplete", "truncated_calls",
-                            "empty_turns", "unreasoned_calls")
-            },
-            "cached_fraction_median": _median_known(
-                [row["cached_fraction"] for row in batch]
-            ),
-        }
-    one = results["1"]["sessions_per_hour"]["median"]
-    optimal = _operating_point(results)
     return {
-        "steps": conversation_steps(context, settings),
-        "by_streams": results,
-        "optimal_streams": optimal,
-        "scaling_vs_1x": {
-            stream_count: (
-                result["sessions_per_hour"]["median"] / one if one else 0
-            )
-            for stream_count, result in results.items()
+        "streams": stream_count,
+        "samples": batch,
+        "wall_seconds": _median_range(batch, "wall_seconds"),
+        "sessions_per_hour": _median_range(batch, "sessions_per_hour"),
+        "output_tokens_per_session": statistics.median(
+            [row["output_tokens_per_session"] for row in batch]
+        ),
+        "prefill_tokens_per_second": _median_known(
+            [row["prefill_tokens_per_second"] for row in batch]
+        ),
+        "report_decode_tokens_per_second": _median_known(
+            [row["report_decode_tokens_per_second"] for row in batch]
+        ),
+        "turn_decode_tokens_per_second": {
+            position: _median_known([
+                row["turn_decode_tokens_per_second"][position]
+                for row in batch
+            ])
+            for position in ("first", "middle", "last")
         },
+        "sessions": sum(row["streams"] for row in batch),
+        **{
+            key: sum(row[key] for row in batch)
+            for key in ("sessions_incomplete", "truncated_calls",
+                        "empty_turns", "unreasoned_calls")
+        },
+        "cached_fraction_median": _median_known(
+            [row["cached_fraction"] for row in batch]
+        ),
     }
 
 
@@ -1861,7 +1906,7 @@ def _plan_lines(plan: dict, profile: str) -> list[str]:
         f"  session: {session['steps']} steps from "
         f"{session['evidence_tokens']:,}-token evidence, turns up to "
         f"{session['turn_output_tokens']:,} tokens, report up to "
-        f"{session['report_output_tokens']:,}, streams "
+        f"{session['report_output_tokens']:,}, stream ladder "
         f"{_stream_list(session['streams'])}",
     ]
 
@@ -1950,6 +1995,11 @@ def _summary_lines(result: dict) -> list[str]:
                 f"  optimal operating point: {optimal}x"
                 if optimal
                 else "  no stream count completed every session"
+            )
+        if session.get("ladder_stop", "ladder_top") != "ladder_top":
+            lines.append(
+                f"  ladder stopped at {list(session['by_streams'])[-1]}x: "
+                f"{session['ladder_stop'].replace('_', ' ')}"
             )
         totals = {
             key: sum(
@@ -2226,6 +2276,7 @@ def run_benchmark(
         f"profile={settings.profile} streams={settings.streams} "
         f"samples={settings.min_samples}-{settings.samples} "
         f"(agreement {settings.sample_agreement:.0%}) "
+        f"stream-gain={settings.stream_gain:.0%} "
         f"sampling={settings.sampling or 'undeclared'}"
     )
     if settings.gate_cmd:

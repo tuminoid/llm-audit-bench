@@ -86,7 +86,7 @@ uv run capability-check --base-url http://127.0.0.1:8000 \
 
 | Profile | What it measures | When to use it |
 | -- | -- | -- |
-| `session` | The llama-bench pp512/tg128 reference, the near-context capacity proof, then scripted agent sessions at 1 stream and the largest stream count the operating point admits: 32k of evidence, up to 16 tool results bounded by 7/8 of context, the model's natural turns, and a final report | The canonical serving result for a tuned operating point |
+| `session` | The llama-bench pp512/tg128 reference, the near-context capacity proof, then scripted agent sessions climbing from 1 stream up the counts the operating point admits while each gains 10%: 32k of evidence, up to 16 tool results bounded by 7/8 of context, the model's natural turns, and a final report | The canonical serving result for a tuned operating point |
 | `conversation` | A model-driven audit tool loop over the same evidence, ending in a verdict, with measured prefix-cache reuse | Model usability: does the model follow the tool-loop protocol at all; run it before committing a model to real audits |
 
 Both profiles need tool calling. Sessions/hour says whether the server

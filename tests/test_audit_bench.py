@@ -163,21 +163,21 @@ class AuditBenchTest(unittest.TestCase):
         plan = build_plan(262144, settings(), 1, 2748350)
         self.assertEqual(plan["session"]["streams"], [1])
 
-    def test_256k_plan_runs_one_and_the_serving_concurrency(self):
+    def test_256k_plan_climbs_to_the_serving_concurrency(self):
         plan = build_plan(262144, settings(), 8, 2748350)
         self.assertEqual(plan["capacity_near"]["target_prompt_tokens"], 245760)
         self.assertEqual(plan["capacity_near"]["streams"], [1, 8])
         self.assertEqual(plan["session"]["steps"], 16)
         self.assertEqual(plan["session"]["per_stream_kv_demand"], 184320)
-        self.assertEqual(plan["session"]["streams"], [1, 8])
+        self.assertEqual(plan["session"]["streams"], [1, 2, 4, 8])
         self.assertTrue(plan["preferred_256k_context"])
 
     def test_720k_plan_takes_the_largest_candidate_the_pool_holds(self):
         # 746,553 tokens hold four 184,320-token sessions: candidates
-        # 1/2/4 fit, so the plan runs 1x and 4x.
+        # 1/2/4 fit, so the ladder tops out at 4x.
         plan = build_plan(737280, settings(), 8, 746553)
         self.assertEqual(plan["capacity_near"]["streams"], [1])
-        self.assertEqual(plan["session"]["streams"], [1, 4])
+        self.assertEqual(plan["session"]["streams"], [1, 2, 4])
 
     def test_capacity_proof_runs_once_per_stream_count(self):
         adaptive = dataclasses.replace(
@@ -224,6 +224,19 @@ class AuditBenchTest(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 Settings.from_env()
+        with mock.patch.dict(
+            os.environ, {**SAMPLING, "AUDIT_BENCH_STREAM_GAIN": "0"},
+            clear=False,
+        ):
+            parsed = Settings.from_env()
+            self.assertEqual(parsed.stream_gain, 0)
+            self.assertFalse(parsed.canonical)
+        for value in ("1", "-0.1", "ten"):
+            with mock.patch.dict(
+                os.environ, {"AUDIT_BENCH_STREAM_GAIN": value}, clear=False
+            ):
+                with self.assertRaises(ValueError):
+                    Settings.from_env()
         with mock.patch.dict(
             os.environ, {**SAMPLING, "AUDIT_BENCH_SAMPLES": "1"}, clear=False
         ):
@@ -821,7 +834,7 @@ class AuditBenchTest(unittest.TestCase):
         result, text = self._run_fake_protocol({"AUDIT_BENCH_GATE_CMD": ""})
         self.assertEqual(result, 0)
         report = json.loads(text.splitlines()[-1])
-        self.assertEqual(report["schema_version"], 8)
+        self.assertEqual(report["schema_version"], 9)
         self.assertEqual(report["protocol"], "audit-v2")
         self.assertFalse(report["publishable"])
         self.assertEqual(
@@ -872,6 +885,41 @@ class AuditBenchTest(unittest.TestCase):
             _operating_point({"1": section(1, 8.0, 1), "4": section(4, 8.7, 1)}),
             None,
         )
+
+    def _ladder(self, rates, incomplete=()):
+        """Climb 1/2/4/8 with each rung's median rate given by stream count."""
+        def rung(chat, calibration, context, settings, stream_count):
+            return {"streams": stream_count,
+                    "sessions_incomplete": int(stream_count in incomplete),
+                    "sessions_per_hour": {"median": rates[stream_count]}}
+
+        with mock.patch("audit_bench._measure_stream_count", rung), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return _measure_sessions(
+                None, CALIBRATION, 131072, self._session_settings(),
+                (1, 2, 4, 8),
+            )
+
+    def test_ladder_climbs_while_each_rung_gains_the_threshold(self):
+        measured = self._ladder({1: 2.0, 2: 3.0, 4: 3.4, 8: 4.0})
+        self.assertEqual(list(measured["by_streams"]), ["1", "2", "4", "8"])
+        self.assertEqual(measured["ladder_stop"], "ladder_top")
+        self.assertEqual(measured["optimal_streams"], 8)
+
+    def test_ladder_stops_at_the_first_rung_gaining_too_little(self):
+        # 2x gains 9% over 1x: 4x and 8x never run, 2x is still the fastest
+        # complete rung and is published.
+        measured = self._ladder({1: 20.0, 2: 21.8, 4: 30.0, 8: 40.0})
+        self.assertEqual(list(measured["by_streams"]), ["1", "2"])
+        self.assertEqual(measured["ladder_stop"], "gain_below_threshold")
+        self.assertEqual(measured["optimal_streams"], 2)
+
+    def test_ladder_stops_at_a_rung_with_an_incomplete_session(self):
+        measured = self._ladder({1: 8.0, 2: 12.0, 4: 30.0, 8: 40.0},
+                                incomplete=(2,))
+        self.assertEqual(list(measured["by_streams"]), ["1", "2"])
+        self.assertEqual(measured["ladder_stop"], "incomplete_sessions")
+        self.assertEqual(measured["optimal_streams"], 1)
 
     def test_noncompliant_conversation_is_unpublishable(self):
         # The session fake never calls a tool, so the model-driven loop
@@ -939,7 +987,7 @@ class AuditBenchTest(unittest.TestCase):
             self.assertEqual(len(retained), 1)
             self.assertIn(f"json: {retained[0]}", text)
             report = json.loads(retained[0].read_text(encoding="utf-8"))
-        self.assertEqual(report["schema_version"], 8)
+        self.assertEqual(report["schema_version"], 9)
         self.assertEqual(report["artifact_path"], str(retained[0]))
         self.assertIn("audit_session", report)
 
