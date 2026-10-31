@@ -25,8 +25,9 @@ The benchmark measures exactly that shape, at the model's own sampling:
   published figures, not a serving result;
 - the near-context capacity proof, a gate that the configured context
   really serves;
-- the agent session, the serving benchmark, at one stream and at the
-  largest canonical stream count the operating point admits; and
+- the agent session, the serving benchmark, climbing from one stream up
+  the canonical stream counts the operating point admits while each one
+  pays; and
 - the audit conversation, the model-usability check, where the model
   drives the tool loop itself.
 
@@ -41,21 +42,22 @@ The benchmark measures exactly that shape, at the model's own sampling:
 | Sample agreement | 5% spread |
 | Prompt target tolerance (`AUDIT_BENCH_TARGET_TOLERANCE`) | 2% |
 | Candidate streams | 1, 2, 4, 8 |
+| Stream gain (`AUDIT_BENCH_STREAM_GAIN`) | 10% over the rung below |
 | Near-ceiling target | 15/16 of configured context |
 | Sampling | declared by the model configuration |
 
 Each sample uses different deterministic audit evidence from the first token,
-so independent samples cannot collapse into a shared prefix-cache hit. Stream
-counts are interleaved across sample passes to reduce thermal and power
-ordering bias. Results report the median and retain the minimum, maximum, and
-raw samples.
+so independent samples cannot collapse into a shared prefix-cache hit. The
+near-context capacity proof interleaves its stream counts; the session's
+rungs run in ladder order, each rung's samples back to back, because whether
+a rung runs at all depends on the one below. Results report the median and
+retain the minimum, maximum, and raw samples.
 
 ### Adaptive sampling
 
 The canonical protocol runs 2 samples and extends toward 3 only on
-disagreement. In a stream-count family, one disagreeing count extends
-the whole family by a full interleaved pass, keeping the ordering symmetric.
-The near-context capacity proof runs once.
+disagreement. Each session rung extends on its own disagreement. The
+near-context capacity proof runs once.
 
 What must agree depends on the workload. A session decodes at natural
 lengths under sampling, so its wall time varies with the model's own
@@ -286,8 +288,15 @@ without one, a usage chunk without token counts, or a call that reports more
 than one token but streamed no delta, is an error. An end-of-turn-only answer
 streams nothing and counts wholly as prefill.
 
-Stream counts are 1 and the largest canonical candidate that fits active
-admission and the KV pool. Per-stream demand is the final resent
+The session climbs a stream ladder: the canonical candidates that fit active
+admission and the KV pool, from 1 upwards. The next rung runs only when the
+current one completed every session and, above 1x, its median sessions/hour
+gained at least the stream gain over the rung below; otherwise the ladder
+stops there and records why (`audit_session.ladder_stop`:
+`gain_below_threshold`, `incomplete_sessions`, or `ladder_top` when every
+admitted rung ran). A rung that dropped a session is no baseline for the
+next, and concurrency that stopped paying is not worth the memory it holds.
+Per-stream demand is the final resent
 conversation plus the report cap, with no shared-prefix credit, so admission
 never depends on cache behavior. Within one sample batch every stream
 carries the identical system message, evidence, and opening turn --
@@ -396,8 +405,8 @@ session scripts its transcript -- and are never compared.
 3. Locate the serving concurrency with noncanonical session runs at
    `AUDIT_BENCH_STREAMS=1,N` for each candidate `N`. Tune scheduler
    admission or Ollama parallel slots, then freeze that operating point.
-4. Run the canonical protocol. It automatically runs 1x and the largest
-   canonical stream count that fits.
+4. Run the canonical protocol. It automatically climbs the stream ladder
+   from 1x and stops where the next rung stops paying.
 5. Record the date, repository commit, model revision, runtime versions, host,
    accelerator, power limit, context, KV policy, memory budget, active slots,
    pool or allocation, and the final AuditBench JSON.
@@ -551,3 +560,25 @@ on 1 of 255 with it. Runs without the control are unchanged.
 Capability Check v2 makes its `json_schema` check advisory in the same
 release and gives its workflow task the same reasoning control (see
 `docs/CAPABILITY.md`, `SCHEMA_VERSION` 6).
+
+## Amendment: 2.5.0 (2026-10-31)
+
+The session measures a stream ladder instead of its two ends. 2.4.0 ran 1x
+and the largest admitted count and never measured between them, so the
+operating point could only be one of the two: on the M5 Max, 4x gained 9 to
+13% over 1x for most models and cost the run's longest leg, while 2x, the
+likely knee, went unmeasured. The session now climbs 1, 2, 4, 8 within
+admission and stops at the first rung that gains less than 10% over the rung
+below or drops a session (`AUDIT_BENCH_STREAM_GAIN`; any other value is
+noncanonical). Publication is unchanged: the fastest measured rung that
+completed every session is `optimal_streams`.
+
+Each stream count's workload, settings and rate are unchanged, so 2.4.0 and
+2.5.0 rates at the same stream count compare; `PROTOCOL` stays `audit-v2`.
+What differs is which counts run: a 2.5.0 result may publish 2x where 2.4.0
+published 4x, and lacks the rungs above where it stopped. Rungs now run their
+samples back to back instead of interleaved with the other count, since a
+rung's existence depends on the one below; any thermal drift therefore falls
+on the later, higher rung and makes the ladder stop early rather than late.
+An incomplete 1x stops the ladder, where 2.4.0 still measured the top count.
+`SCHEMA_VERSION` 9 adds `audit_session.ladder_stop`.
