@@ -21,7 +21,7 @@ The protocol uses fixed local fixtures:
 | Thinking disabled | When configured, the documented control produces correct content with an empty reasoning field |
 | Tool call | With automatic tool choice, one non-streaming `lookup_issue` call carries `{"issue_number": 42}` |
 | Streaming tool call | With automatic tool choice, one streamed `lookup_issue` call is assembled with `{"issue_number": 42}` |
-| Tool round trip | The model consumes the returned `sentinel-cobalt` value and finishes without another tool call |
+| Tool round trip | The model consumes the returned `sentinel-cobalt` value (a U+2010 or U+2011 hyphen counts as its hyphen) and finishes without another tool call |
 | Structured JSON | The final content is the exact requested JSON object, without Markdown cleanup. The same check records, without gating, what the model manages when asked for the full fixture document with the schema stated in words (`unaided`) |
 | JSON schema | Advisory: recorded with its status, never decides the verdict. The endpoint is honest about schema enforcement: it either constrains decoding to the fixture schema, or refuses the parameter with a 4xx. Accepting it and returning anything else fails the check |
 | Audit fitness | Fewer than `FITNESS_FAILURE_LIMIT` (2) of the audit samples fail: three audit-shaped tasks (two for a model without tools), four samples each, at the declared sampling |
@@ -348,6 +348,14 @@ substitute for the model's own structured-output result.
 
 ## Amendments
 
+- **Typeset sentinel hyphens accepted** (report shape unchanged,
+  `SCHEMA_VERSION` 7). The tool round trip matched `sentinel-cobalt`
+  byte for byte, so a model that consumed the tool result but typeset the
+  hyphen as U+2011 NON-BREAKING HYPHEN failed it (Nemotron 3.5 Lightning:
+  `**sentinel` U+2011 `cobalt**`). U+2010 HYPHEN and U+2011 now match the
+  hyphen; other dashes still fail. The fixture is unchanged and a pass
+  under the old rule is a pass under the new one; a `tool_round_trip`
+  failure that quotes a typeset hyphen should be rerun.
 - **Single-answer cap from the served context** (`SCHEMA_VERSION` 7). The
   selection and triage cap is a quarter of the served per-request context,
   the output budget audit clients give the model, and never below the old

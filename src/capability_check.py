@@ -34,6 +34,9 @@ SCHEMA_VERSION = 7
 ADVISORY_CHECKS = ("json_schema",)
 TOOL_NAME = "lookup_issue"
 TOOL_SENTINEL = "sentinel-cobalt"
+# Models typeset the sentinel's hyphen as U+2010 HYPHEN or U+2011
+# NON-BREAKING HYPHEN; both are the same hyphen, so they match it.
+SENTINEL_HYPHENS = str.maketrans({"\u2010": "-", "\u2011": "-"})
 # Schema enforcement is a server property: constrained decoding masks
 # invalid tokens during sampling, so the fixture pairs a strict schema with
 # a prompt that demands the wrong shape. An endpoint that only asks the
@@ -2133,7 +2136,7 @@ def run_capability_check(
                 )
                 _require_completed(result)
                 _no_leak(result.content)
-                if TOOL_SENTINEL not in result.content:
+                if TOOL_SENTINEL not in result.content.translate(SENTINEL_HYPHENS):
                     raise RuntimeError(
                         f"final answer did not consume tool result: {result.content!r}"
                     )
