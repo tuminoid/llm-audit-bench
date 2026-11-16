@@ -288,6 +288,28 @@ class ProseAdapter(FakeAdapter):
         )
 
 
+class TypesetSentinelAdapter(FakeAdapter):
+    """A model that typesets the tool result's hyphen as U+2011."""
+
+    def __init__(self, hyphen="\u2011"):
+        self.hyphen = hyphen
+
+    def chat(self, messages, *, max_tokens, stream, tools=None,
+             options=None):
+        if any(message.get("role") == "tool" for message in messages):
+            return ChatResult(
+                content=f"The status token for issue\u202f42 is "
+                f"**sentinel{self.hyphen}cobalt**.",
+                chunks=1,
+                completed=True,
+                finish_reason="stop",
+            )
+        return super().chat(
+            messages, max_tokens=max_tokens, stream=stream, tools=tools,
+            options=options,
+        )
+
+
 class SchemalessAdapter(FakeAdapter):
     """An adapter that cannot express enforcement at all."""
 
@@ -529,6 +551,24 @@ class CapabilityCheckTest(unittest.TestCase):
                     **overrides,
                 )
         return code, output.getvalue()
+
+    def test_tool_round_trip_accepts_typeset_hyphens(self):
+        for hyphen in ("\u2010", "\u2011"):
+            with self.subTest(hyphen=hex(ord(hyphen))), \
+                    tempfile.TemporaryDirectory() as directory:
+                code, text = self._run(
+                    "human", directory, adapter=TypesetSentinelAdapter(hyphen)
+                )
+                self.assertEqual(code, 0, text)
+                self.assertRegex(text, r"tool_round_trip\s+passed")
+
+    def test_tool_round_trip_rejects_other_dashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            code, text = self._run(
+                "human", directory, adapter=TypesetSentinelAdapter("\u2013")
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("final answer did not consume tool result", text)
 
     def test_complete_protocol_passes(self):
         with tempfile.TemporaryDirectory() as directory:
