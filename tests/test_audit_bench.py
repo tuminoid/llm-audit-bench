@@ -37,6 +37,7 @@ from audit_bench import (
     parse_sampling,
     parse_streams,
     run_benchmark,
+    session_row,
     vllm_capacity,
 )
 
@@ -1808,6 +1809,112 @@ class CliMainTest(unittest.TestCase):
                     "--dry-run",
                 ]
             )
+
+
+def session_document(**session) -> dict:
+    """A retained session document as the harness writes it, trimmed to
+    what a row reads plus the fields a row must leave out."""
+    section = {
+        "streams": 1,
+        "sessions": 2,
+        "sessions_incomplete": 0,
+        "sessions_per_hour": {"median": 6.74, "min": 6.5, "max": 7.0},
+        "output_tokens_per_session": 5144.0,
+        "prefill_tokens_per_second": 968.1,
+        "report_decode_tokens_per_second": 19.3,
+    }
+    return {
+        "protocol": "audit-v2",
+        "schema_version": 7,
+        "canonical": True,
+        "publishable": True,
+        "publication_reasons": [],
+        "artifact_path": "/home/someone/state/x_session.json",
+        "settings": {"profile": "session"},
+        "plan": {"configured_context": 262144},
+        "reference": {"unavailable": "no fixed-length contract"},
+        "metadata": {
+            "runtime": "ollama",
+            "tag": "conf",
+            "model": "m:tag",
+            "host": "somehost",
+            "base_url": "http://127.0.0.1:11434",
+            "active_slots": 1,
+            "kv_pool_tokens": 262144,
+            "capacity_source": "allocated context x effective slots",
+            "model_identity": {"digest": "abc", "resolved_name": "m"},
+            "files": {"audit_bench": {"name": "audit_bench.py",
+                                      "sha256": "h"}},
+        },
+        "audit_session": {"steps": 16, "by_streams": {"1": section},
+                          **session},
+    }
+
+
+class SessionRowTest(unittest.TestCase):
+    def test_a_pre_2_3_0_document_derives_its_operating_point(self):
+        row = session_row(session_document())
+        self.assertEqual(row["optimal_streams"], 1)
+        self.assertEqual(row["optimal_streams_source"], "derived")
+        self.assertEqual(row["streams"]["1"]["sessions_per_hour"], 6.74)
+        self.assertIsNone(row["reference"])
+        self.assertEqual(row["model_identity"], "abc")
+        self.assertEqual(row["artifact"], "x_session.json")
+
+    def test_the_derived_point_is_the_fastest_complete_count(self):
+        document = session_document()
+        by_streams = document["audit_session"]["by_streams"]
+        by_streams["2"] = {**by_streams["1"], "streams": 2,
+                           "sessions_per_hour": {"median": 9.0}}
+        by_streams["4"] = {**by_streams["1"], "streams": 4,
+                           "sessions_incomplete": 1,
+                           "sessions_per_hour": {"median": 12.0}}
+        self.assertEqual(session_row(document)["optimal_streams"], 2)
+
+    def test_a_measured_reference_and_a_revision_identity(self):
+        document = session_document()
+        document["reference"] = {
+            "prompt_processing": {"tokens_per_second": {"mean": 1561.0}},
+            "token_generation": {"tokens_per_second": {"mean": 105.8}},
+        }
+        document["metadata"]["model_identity"] = {"revision": "r" * 40}
+        row = session_row(document)
+        self.assertEqual(row["reference"], {"pp512": 1561.0, "tg128": 105.8})
+        self.assertEqual(row["model_identity"], "r" * 40)
+
+    def test_a_stored_operating_point_is_read_not_derived(self):
+        row = session_row(session_document(optimal_streams=None))
+        self.assertIsNone(row["optimal_streams"])
+        self.assertEqual(row["optimal_streams_source"], "stored")
+
+    def test_the_row_leaves_out_host_paths_and_identity_objects(self):
+        text = json.dumps(session_row(session_document()))
+        for private in ("somehost", "/home/someone", "127.0.0.1",
+                        "resolved_name"):
+            self.assertNotIn(private, text)
+
+    def test_show_prints_the_row_and_refuses_a_plan_only_document(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "x_session.json"
+            path.write_text(json.dumps(session_document()), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["--show", str(path), "--format", "row"])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue())["tag"], "conf")
+            document = session_document()
+            del document["audit_session"]
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "measured session"):
+                main(["--show", str(path), "--format", "row"])
+
+    def test_row_format_needs_show(self):
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit):
+                main(["--base-url", "http://127.0.0.1:9", "--context", "8",
+                      "--format", "row"])
+        self.assertIn("--format row projects a retained document",
+                      errors.getvalue())
 
 
 if __name__ == "__main__":

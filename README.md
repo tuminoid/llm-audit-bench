@@ -133,7 +133,9 @@ JSON under `${XDG_STATE_HOME:-~/.local/state}/capability-check/` and
 `--format json` for tools.
 
 Either command lists what it has retained with `--list`, and re-prints one
-with `--show`, contacting no server. `--show` takes the file name straight
+with `--show`, contacting no server; `--show FILE --format row` prints
+the results-table row of one document instead (see the protocol
+documents). `--show` takes the file name straight
 from the listing, resolved in the retention directory, or any path:
 
 ```bash

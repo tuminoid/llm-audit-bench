@@ -199,6 +199,20 @@ given. It refuses a document that predates the `publishable` verdict rather
 than inferring one, and names the last harness commit that renders an
 `audit-v1` document instead of rendering it. It exits 0 whenever it printed.
 
+`audit-bench --show FILE --format row` prints one session-profile document
+as the row a results table publishes, one JSON object: the verdicts and
+their reasons, runtime, tag, model, configured context, active slots, KV
+pool, per stream count the median sessions/h with complete sessions,
+output tokens, prefill and report decode, the operating point, the
+pp512/tg128 means or null, the model digest or revision, and the file
+name. Values are read as stored. A document
+before `SCHEMA_VERSION` 8 has no `optimal_streams`; the row derives it from
+`by_streams` under the 2.3.0 rule and marks `optimal_streams_source`
+`derived`, keeping the document's own publication verdict. The host,
+paths and whole identity objects are left out, so a serving repository can
+commit the row. `session_row()` is the same projection for tools that
+import the module. The row is a projection; the document is the result.
+
 `audit-bench --list` prints the retention directory and indexes what is in
 it -- time, runtime and tag, profile, verdict, and file name, newest first --
 so the retained documents are discoverable without knowing the path

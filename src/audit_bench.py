@@ -2149,9 +2149,81 @@ def _list_documents() -> int:
     return 0
 
 
+def session_row(document: dict) -> dict:
+    """Project one retained session document onto a published results row.
+
+    The fields are the ones a results table publishes, read as stored; the
+    retained document stays the result. The host, paths and whole identity
+    objects stay out, so a serving repository can commit the row. A
+    document before SCHEMA_VERSION 8 has no optimal_streams: the row
+    derives it from the retained by_streams under the 2.3.0 amendment and
+    says so, and keeps the document's own publication verdict.
+    """
+    session = document.get("audit_session")
+    if document["settings"].get("profile") != "session" or not session:
+        raise ValueError(
+            "a row projects a measured session profile document"
+        )
+    metadata = document["metadata"]
+    by_streams = session["by_streams"]
+    if "optimal_streams" in session:
+        optimal, source = session["optimal_streams"], "stored"
+    else:
+        optimal, source = _operating_point(by_streams), "derived"
+    identity = metadata.get("model_identity") or {}
+    reference = document.get("reference") or {}
+    measured = "prompt_processing" in reference
+    artifact = document.get("artifact_path")
+    return {
+        "protocol": document["protocol"],
+        "schema_version": document.get("schema_version"),
+        "canonical": document["canonical"],
+        "publishable": document["publishable"],
+        "publication_reasons": document["publication_reasons"],
+        "runtime": metadata["runtime"],
+        "tag": metadata["tag"],
+        "model": metadata["model"],
+        "configured_context": document["plan"]["configured_context"],
+        "active_slots": metadata["active_slots"],
+        "kv_pool_tokens": metadata["kv_pool_tokens"],
+        "streams": {
+            count: {
+                "sessions_per_hour": section["sessions_per_hour"]["median"],
+                "sessions": section["sessions"],
+                "sessions_incomplete": section["sessions_incomplete"],
+                "output_tokens_per_session": section[
+                    "output_tokens_per_session"
+                ],
+                "prefill_tokens_per_second": section[
+                    "prefill_tokens_per_second"
+                ],
+                "report_decode_tokens_per_second": section[
+                    "report_decode_tokens_per_second"
+                ],
+            }
+            for count, section in by_streams.items()
+        },
+        "optimal_streams": optimal,
+        "optimal_streams_source": source,
+        "reference": {
+            "pp512": reference["prompt_processing"]["tokens_per_second"][
+                "mean"
+            ],
+            "tg128": reference["token_generation"]["tokens_per_second"][
+                "mean"
+            ],
+        } if measured else None,
+        "model_identity": identity.get("digest") or identity.get("revision"),
+        "artifact": pathlib.PurePath(artifact).name if artifact else None,
+    }
+
+
 def _print_document(document: dict, output_format: str) -> None:
     if output_format == "json":
         print(json.dumps(document, sort_keys=True))
+        return
+    if output_format == "row":
+        print(json.dumps(session_row(document), sort_keys=True))
         return
     for line in _summary_lines(document):
         print(line)
@@ -2206,7 +2278,10 @@ def _show(path: pathlib.Path, output_format: str) -> int:
             "read the JSON directly"
         )
     document.setdefault("artifact_path", str(path))
-    _print_document(document, output_format)
+    try:
+        _print_document(document, output_format)
+    except ValueError as exc:
+        raise SystemExit(f"{path}: {exc}") from exc
     return 0
 
 
@@ -2486,11 +2561,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--format",
-        choices=("human", "json"),
+        choices=("human", "json", "row"),
         default="human",
         help=(
             "stdout result format (default human); the JSON document is "
-            "retained on disk either way"
+            "retained on disk either way; row, with --show only, prints the "
+            "published results row of a session document"
         ),
     )
     documents = parser.add_mutually_exclusive_group()
@@ -2519,6 +2595,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list_documents:
         return _list_documents()
+    if args.format == "row" and not args.show:
+        parser.error("--format row projects a retained document; use --show")
     if args.show:
         return _show(args.show, args.format)
     for name in ("base_url", "context"):
