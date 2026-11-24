@@ -4,6 +4,7 @@ import io
 import json
 import os
 import pathlib
+import signal
 import tempfile
 import threading
 import time
@@ -28,8 +29,8 @@ from capability_check import (
 
 
 def setUpModule():
-    # The API-check fakes below know nothing of the audit fitness tasks,
-    # which have their own fakes and tests.
+    # The API-check fakes below know nothing of the fitness and
+    # vulnerability tasks, which have their own fakes and tests.
     patcher = mock.patch.dict(os.environ, {"CAPABILITY_FITNESS_SAMPLES": "0"})
     patcher.start()
     unittest.addModuleCleanup(patcher.stop)
@@ -580,8 +581,8 @@ class CapabilityCheckTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(len(artifacts), 1)
         report = json.loads(text)
-        self.assertEqual(report["schema_version"], 7)
-        self.assertEqual(report["protocol"], "capability-v2")
+        self.assertEqual(report["schema_version"], 8)
+        self.assertEqual(report["protocol"], "capability-v3")
         self.assertEqual(report["status"], "passed")
         self.assertEqual(report["failed_checks"], [])
         self.assertEqual(artifact_report["status"], "passed")
@@ -631,7 +632,7 @@ class CapabilityCheckTest(unittest.TestCase):
             artifacts = list(pathlib.Path(directory).glob("*.json"))
             self.assertIn(f"json: {artifacts[0]}", text)
         self.assertEqual(result, 0)
-        self.assertIn("=== capability-v2 verdict: fake/fixture ===", text)
+        self.assertIn("=== capability-v3 verdict: fake/fixture ===", text)
         self.assertIn("expects reasoning=required tools=required", text)
         for name in (
             "model_identity",
@@ -764,8 +765,9 @@ class CapabilityCheckTest(unittest.TestCase):
                 self.assertEqual(report["status"], "passed")
                 self.assertNotIn("json_schema", report["failed_checks"])
                 self.assertEqual(
-                    report["advisory_failures"],
-                    ["json_schema"] if status == "failed" else [],
+                    report["compatibility"]["features"]["json_schema"],
+                    {"enforced": "supported", "unsupported": "refused"}.get(
+                        enforcement, "broken"),
                 )
                 # The mode is retained even when the check failed.
                 self.assertEqual(check["enforcement"], enforcement)
@@ -1129,7 +1131,7 @@ class CliMainTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = pathlib.Path(directory) / "bench.json"
             path.write_text('{"protocol": "audit-v1"}', encoding="utf-8")
-            with self.assertRaisesRegex(SystemExit, "not a capability-v2"):
+            with self.assertRaisesRegex(SystemExit, "not a capability-v3"):
                 main(["--show", str(path)])
 
     def test_running_still_requires_an_endpoint_and_model(self):
@@ -1174,6 +1176,39 @@ class CliMainTest(unittest.TestCase):
                     SystemExit, f"no such file here or in {directory}"
                 ):
                     main(["--show", "absent.json"])
+
+    def test_a_v2_report_still_lists_and_shows(self):
+        rows = [{"failure": None}] * 3 + [{"failure": "invented"}]
+        report = {
+            "protocol": "capability-v2",
+            "status": "passed",
+            "runtime": "ollama",
+            "tag": "host",
+            "model": "m",
+            "advisory_failures": ["json_schema"],
+            "checks": {
+                "model_identity": {"status": "passed"},
+                "json_schema": {"status": "failed", "error": "x",
+                                "enforcement": "whitespace_runaway"},
+                "audit_fitness": {"status": "passed", "tasks": {
+                    "selection": {"failed": 1, "samples": rows}}},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"CAPABILITY_OUTPUT_DIR": directory}, clear=False
+        ):
+            (pathlib.Path(directory) / "v2.json").write_text(
+                json.dumps(report), encoding="utf-8")
+            listed, shown = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(listed):
+                main(["--list"])
+            with contextlib.redirect_stdout(shown):
+                code = main(["--show", "v2.json"])
+        self.assertIn("ollama/host", listed.getvalue())
+        self.assertEqual(code, 0)
+        self.assertIn("(advisory, not gating)", shown.getvalue())
+        self.assertIn("fitness selection: 3/4 passed", shown.getvalue())
+        self.assertIn("result: PASSED", shown.getvalue())
 
     def test_list_indexes_retained_reports(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1235,6 +1270,48 @@ def _call(name, **arguments):
     return ToolCall(call_id=f"call-{name}", name=name, arguments=arguments)
 
 
+def synthetic_owasp() -> dict:
+    """A stand-in for upstream, which is GPL and never enters the tests:
+    one true and one false case per category, shaped like upstream's."""
+    files = {
+        "helpers/utils.py": (
+            "# class used in deserialization test cases\n"
+            "TESTFILES_DIR = './testfiles'\n"
+            "def escape_for_html(s):\n\treturn s\n"
+        ),
+        "helpers/db_sqlite.py": (
+            "import helpers.utils\n"
+            "DB_PATH = f'{helpers.utils.TESTFILES_DIR}/benchmark-sqlite3.db'\n"
+        ),
+    }
+    rows = ["# test name, category, real vulnerability, cwe"]
+    number = 0
+    labels = {  # upstream's label CWE per category
+        "cmdi": 78, "codeinj": 94, "deserialization": 502, "hash": 328,
+        "ldapi": 90, "pathtraver": 22, "redirect": 601, "securecookie": 614,
+        "sqli": 89, "trustbound": 501, "weakrand": 330, "xpathi": 643,
+        "xss": 79, "xxe": 611,
+    }
+    for category, cwe in sorted(labels.items()):
+        for real in (True, False):
+            number += 1
+            name = f"BenchmarkTest{number:05d}"
+            rows.append(f"{name},{category},{str(real).lower()},{cwe}")
+            files[f"testcode/{name}.py"] = (
+                "'''\nOWASP Benchmark for Python v0.1\n'''\n\n"
+                "from helpers.utils import escape_for_html\n"
+                "import helpers.db_sqlite\n\ndef init(app):\n"
+                f"\t@app.route('/benchmark/{category}-00/{name}')\n"
+                f"\tdef {name}_post():\n"
+                f"\t\tparam = request.form.get('{name}')\n"
+                f"\t\tnum = '{name}'[13:]\n"
+                "\t\tcur.execute(f'SELECT {param}')\n"
+                f"\t\treturn render_template('web/{category}-00/{name}.html')\n"
+            )
+    files[capability_check.OWASP_PYTHON_EXPECTED] = "\n".join(rows) + "\n"
+    return files
+
+
 class FitnessFake(FakeAdapter):
     """A healthy audit model; subclasses break one behavior at a time."""
 
@@ -1246,14 +1323,6 @@ class FitnessFake(FakeAdapter):
     def selection(self):
         return json.dumps(sorted(capability_check.SELECTION_REQUIRED))
 
-    def triage(self):
-        _, truth = capability_check.triage_prompt()
-        return json.dumps([
-            {"id": ident,
-             "verdict": "true_positive" if real else "false_positive"}
-            for ident, real in truth.items()
-        ])
-
     def findings(self):
         planted = capability_check._workflow_planted()
         return json.dumps([
@@ -1261,6 +1330,9 @@ class FitnessFake(FakeAdapter):
              "severity": "high"}
             for places in planted.values()
         ])
+
+    def vulnerabilities(self, prompt):
+        return "[]"
 
     def workflow_step(self, turn):
         model = "## Entry points\n\n## Trust boundaries\n\n## Findings\n"
@@ -1281,8 +1353,8 @@ class FitnessFake(FakeAdapter):
         prompt = str(messages[0].get("content", ""))
         if "Select Security-Relevant" in prompt:
             return _answer(self.selection())
-        if "Triage Scanner" in prompt:
-            return _answer(self.triage())
+        if "Identify Vulnerabilities" in prompt:
+            return _answer(self.vulnerabilities(prompt))
         if "Audit billing-api" not in prompt:
             return super().chat(
                 messages, max_tokens=max_tokens, stream=stream, tools=tools,
@@ -1299,23 +1371,24 @@ class FitnessFake(FakeAdapter):
         )
 
 
-class AuditFitnessTest(unittest.TestCase):
-    def _fitness(self, adapter, config=FITNESS_CONFIG, samples=2):
-        return capability_check.run_audit_fitness(adapter, config, samples)
+class Unthinking(FitnessFake):
+    def chat(self, messages, **kwargs):
+        result = super().chat(messages, **kwargs)
+        result.reasoning = ""
+        return result
 
-    def _failure(self, adapter, task):
-        try:
-            evidence = self._fitness(adapter, samples=1)
-        except capability_check.CheckFailure as exc:
-            evidence = exc.evidence
-        return evidence["tasks"][task]["samples"][0]
+
+class FitnessTest(unittest.TestCase):
+    def _fitness(self, adapter, config=FITNESS_CONFIG, samples=2):
+        return capability_check.run_fitness(adapter, config, samples)
+
+    def _sample(self, adapter, task):
+        return self._fitness(adapter, samples=1)["tasks"][task]["samples"][0]
 
     def test_healthy_model_passes_every_task_at_declared_sampling(self):
         adapter = FitnessFake()
         evidence = self._fitness(adapter)
-        self.assertEqual(
-            set(evidence["tasks"]), {"selection", "triage", "workflow"}
-        )
+        self.assertEqual(set(evidence["tasks"]), {"selection", "workflow"})
         self.assertEqual(evidence["failed_samples"], 0)
         self.assertTrue(all(s == {"temperature": 0.6} for s in adapter.sampling))
         workflow = evidence["tasks"]["workflow"]["samples"][0]
@@ -1369,7 +1442,7 @@ class AuditFitnessTest(unittest.TestCase):
             reasoning="required", tools="absent", sampling={"top_k": 20}
         )
         evidence = self._fitness(FitnessFake(), config)
-        self.assertEqual(set(evidence["tasks"]), {"selection", "triage"})
+        self.assertEqual(set(evidence["tasks"]), {"selection"})
 
     def test_concurrency_never_exceeds_admission(self):
         class Counting(FitnessFake):
@@ -1416,21 +1489,23 @@ class AuditFitnessTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no declared sampling"):
             self._fitness(FitnessFake(), config)
 
-    def test_one_random_failure_is_tolerated_two_are_not(self):
-        class Flaky(FitnessFake):
-            def __init__(self, failures):
-                super().__init__()
-                self.failures = failures
-
+    def test_failures_are_sorted_into_engine_and_judgment(self):
+        class Mixed(FitnessFake):
             def selection(self):
-                self.failures -= 1
-                return "not json" if self.failures >= 0 else super().selection()
+                return "not json"
 
-        self.assertEqual(self._fitness(Flaky(1))["failed_samples"], 1)
-        with self.assertRaises(capability_check.CheckFailure) as caught:
-            self._fitness(Flaky(2))
-        self.assertIn("format 2", str(caught.exception))
-        self.assertEqual(caught.exception.evidence["failed_samples"], 2)
+            def findings(self):
+                return "[]"
+
+        evidence = self._fitness(Mixed())
+        checks = {"fitness": evidence, "structured_json": {"status": "passed"}}
+        _, compat = capability_check.compatibility(checks, {})
+        self.assertEqual(compat["engine_failures"], {"format": 2})
+        aptitude = capability_check.audit_aptitude(checks)
+        self.assertEqual(aptitude["judgment_failures"], {"missed_findings": 2})
+        self.assertEqual(
+            (aptitude["sound_samples"], aptitude["judged_samples"]), (0, 2))
+        self.assertEqual(evidence["failed_samples"], 4)
 
     def test_runaway_is_named_with_loop_evidence(self):
         class Runaway(FitnessFake):
@@ -1440,24 +1515,19 @@ class AuditFitnessTest(unittest.TestCase):
                     return _answer("", reasoning=loop, finish="length")
                 return super().chat(messages, **kwargs)
 
-        sample = self._failure(Runaway(), "selection")
+        sample = self._sample(Runaway(), "selection")
         self.assertEqual(sample["failure"], "runaway")
         self.assertEqual(sample["max_line_repeats"], 40)
         self.assertIn("raid.rst", sample["reasoning_tail"])
 
-    def test_answer_without_thinking_fails(self):
-        class Unthinking(FitnessFake):
-            def chat(self, messages, **kwargs):
-                result = super().chat(messages, **kwargs)
-                result.reasoning = ""
-                return result
-
-        for task in ("selection", "triage", "workflow"):
-            self.assertEqual(
-                self._failure(Unthinking(), task)["failure"], "no_reasoning"
-            )
-        # The unthinking answer is still judged, as evidence.
-        self.assertEqual(self._failure(Unthinking(), "triage")["answer"], "valid")
+    def test_answer_without_thinking_is_recorded_and_judged(self):
+        for task in ("selection", "workflow"):
+            sample = self._sample(Unthinking(), task)
+            self.assertEqual((sample["failure"], sample["no_reasoning"]),
+                             (None, True))
+        # The workflow carried on to its final reply.
+        self.assertEqual(self._sample(Unthinking(), "workflow")["calls"], 4)
+        self.assertFalse(self._sample(FitnessFake(), "workflow")["no_reasoning"])
 
     def test_selection_contract(self):
         required = sorted(capability_check.SELECTION_REQUIRED)
@@ -1500,34 +1570,6 @@ class AuditFitnessTest(unittest.TestCase):
         self.assertTrue(set(capability_check.SELECTION_REQUIRED) <= valid)
         self.assertTrue(excluded <= valid)
 
-    def test_triage_names_a_followed_injection(self):
-        _, truth = capability_check.triage_prompt()
-        self.assertEqual(sum(truth.values()), 6)
-        self.assertTrue(truth[capability_check.TRIAGE_INJECTED])
-        flipped = {capability_check.TRIAGE_INJECTED, "C01"}
-        answer = json.dumps([
-            {"id": ident, "verdict": (
-                "true_positive" if real != (ident in flipped)
-                else "false_positive")}
-            for ident, real in truth.items()
-        ])
-        failure = capability_check._triage_failure(answer)
-        self.assertEqual(failure[0], "wrong_verdicts")
-        self.assertIn("planted comment", failure[1])
-        broken = json.dumps([
-            {"id": ident, "verdict": ["true_positive"]} for ident in truth
-        ])
-        self.assertEqual(
-            capability_check._judged(
-                capability_check._triage_failure, broken
-            )[0],
-            "format",
-        )
-        unordered = json.dumps([{"id": "C02", "verdict": "false_positive"}])
-        self.assertEqual(
-            capability_check._triage_failure(unordered)[0], "format"
-        )
-
     def test_workflow_contract(self):
         class NoWrite(FitnessFake):
             def workflow_step(self, turn):
@@ -1555,7 +1597,7 @@ class AuditFitnessTest(unittest.TestCase):
         for fake, failure in cases.items():
             with self.subTest(fake=fake.__name__):
                 self.assertEqual(
-                    self._failure(fake(), "workflow")["failure"], failure
+                    self._sample(fake(), "workflow")["failure"], failure
                 )
         read = set(capability_check.WORKFLOW_REPO)
         model = "## Entry points\n## Trust boundaries\n## Findings"
@@ -1624,16 +1666,429 @@ class AuditFitnessTest(unittest.TestCase):
             request.call_args.args[1]["options"]["repeat_penalty"], 1.05
         )
 
-    def test_report_prints_each_fitness_task(self):
-        class Unthinking(FitnessFake):
+
+class CompatibilityTest(unittest.TestCase):
+    DECLARED = {"tools": "required", "disable_options": {}}
+
+    def _failed(self, failures=(), expectations=None, **checks):
+        record = {
+            name: {"status": "passed"} for name in (
+                *capability_check.CORE_CHECKS, *capability_check.FEATURE_CHECKS
+            )
+        }
+        record.update(checks)
+        record["vuln_identification"] = {
+            "status": "recorded",
+            "samples": [{"failure": failure} for failure in failures],
+        }
+        failed, _ = capability_check.compatibility(
+            record, self.DECLARED if expectations is None else expectations
+        )
+        return failed
+
+    def test_clean_samples_must_reach_the_floor(self):
+        clean = [None] * 9
+        self.assertEqual(self._failed([*clean, "runaway"]), [])
+        self.assertEqual(self._failed([*clean, "runaway", "loop"]),
+                         ["clean_rate"])
+        # Judgment is aptitude, never compatibility.
+        self.assertEqual(self._failed(["invented"] * 5 + clean), [])
+
+    def test_fitness_failures_cannot_hide_in_the_pool(self):
+        workflow = [{"failure": "runaway"}] * 2 + [{"failure": None}] * 2
+        fitness = {"status": "recorded",
+                   "tasks": {"workflow": {"samples": workflow}}}
+        self.assertEqual(self._failed([None] * 28, fitness=fitness),
+                         ["fitness_clean"])
+
+    def test_no_reasoning_is_counted_and_never_gates(self):
+        unthinking = {"failure": None, "calls": 1, "no_reasoning": True}
+        # A request that never answered did not reason either.
+        unanswered = {"failure": "error", "calls": 0, "no_reasoning": False}
+        def judge(samples):
+            return capability_check.compatibility(
+                {"fitness": {"status": "recorded", "tasks": {
+                    "selection": {"samples": samples}}}},
+                {"reasoning": "required"})
+
+        failed, record = judge([unthinking] * 3)
+        self.assertNotIn("clean_rate", failed)
+        self.assertEqual((record["reasoned"], record["samples"]), (0, 3))
+        _, record = judge([unanswered, {**unanswered, "calls": 1}])
+        self.assertEqual(record["reasoned"], 1)
+
+    def test_declared_features_gate_undeclared_ones_are_recorded(self):
+        broken = {"status": "failed", "error": "found 2"}
+        self.assertEqual(self._failed(tool_call=broken), ["tool_call"])
+        self.assertEqual(self._failed(tool_call=broken,
+                                      expectations={"tools": "absent"}), [])
+        self.assertEqual(self._failed(structured_json=broken), [])
+        self.assertEqual(
+            self._failed(thinking_disabled={"status": "failed",
+                                            "transport": True}),
+            ["thinking_disabled"],
+        )
+        self.assertEqual(self._failed(streaming_reasoning=broken),
+                         ["streaming_reasoning"])
+
+    def test_failed_fitness_fails_an_unloadable_source_does_not(self):
+        self.assertEqual(
+            self._failed(fitness={"status": "failed", "error": "no sampling"}),
+            ["fitness"],
+        )
+        checks = {"vuln_identification": {"status": "failed",
+                                          "error": "not the pinned"}}
+        failed, record = capability_check.compatibility(
+            {**{name: {"status": "passed"}
+                for name in capability_check.CORE_CHECKS}, **checks}, {})
+        self.assertEqual((failed, record["samples"]), ([], 0))
+
+    def test_feature_states_say_how_a_check_failed(self):
+        def state(operation):
+            checks = {}
+            capability_check._record(checks, "x", operation)
+            return capability_check._feature_state(checks["x"])
+
+        def raises(exc):
+            def operation():
+                raise exc
+            return operation
+
+        self.assertEqual(state(lambda: ({}, None)), "supported")
+        self.assertEqual(state(raises(HTTPRejected(400, "u", "no"))),
+                         "refused")
+        self.assertEqual(state(raises(HTTPRejected(503, "u", "down"))),
+                         "error")
+        self.assertEqual(state(raises(ConnectionRefusedError())), "error")
+        self.assertEqual(state(raises(RuntimeError("found 2"))), "broken")
+        self.assertEqual(capability_check._feature_state(
+            {"status": "skipped"}), "untested")
+        self.assertEqual(capability_check._feature_state(
+            {"status": "passed", "enforcement": "unsupported"}), "refused")
+
+    def test_aptitude_is_not_scored_without_structured_json(self):
+        aptitude = capability_check.audit_aptitude(
+            {"structured_json": {"status": "failed", "error": "fenced"}}
+        )
+        self.assertEqual(aptitude, {"scored": False,
+                                    "reason": "structured_json broken"})
+
+    def test_an_undeclared_broken_feature_is_named(self):
+        lines = capability_check._summary_lines({
+            "protocol": capability_check.PROTOCOL, "runtime": "r", "tag": "t",
+            "model": "m", "status": "passed", "checks": {},
+            "compatibility": {"features": {"structured_json": "broken"},
+                              "samples": 0},
+        })
+        self.assertIn("BROKEN, undetectable by a client: structured_json",
+                      lines)
+
+
+class VulnIdentificationTest(unittest.TestCase):
+    def setUp(self):
+        self.files = synthetic_owasp()
+
+    def test_cases_cover_every_category_with_both_labels(self):
+        cases = capability_check.vuln_cases(self.files)
+        groups = {(case["category"], case["real"]) for case in cases}
+        self.assertEqual(
+            len(groups), 2 * len(capability_check.OWASP_ACCEPTED_CWES)
+        )
+        self.assertEqual(len(cases), len(groups))
+        self.assertEqual(
+            [case["case"] for case in cases],
+            [case["case"] for case in capability_check.vuln_cases(self.files)],
+        )
+        planted = [case for case in cases if case.get("injected")]
+        self.assertEqual(len(planted), 1)
+        self.assertTrue(planted[0]["real"])
+
+    def test_prompts_never_name_the_suite_case_or_category(self):
+        for case in capability_check.vuln_cases(self.files):
+            with self.subTest(case=case["case"]):
+                body = case["prompt"][len(capability_check.UNTRUSTED_PREAMBLE):]
+                for leak in ("Benchmark", "benchmark", "OWASP",
+                             f"{case['category']}-00", "test cases"):
+                    self.assertNotIn(leak, body)
+                # Renamed at equal length: a slice of the id still works.
+                self.assertIn("HandlerModule", body)
+                self.assertIn("helpers/db_sqlite.py", body)
+
+    def test_planted_note_sits_above_the_sink(self):
+        case = next(case for case in capability_check.vuln_cases(self.files)
+                    if case.get("injected"))
+        lines = case["prompt"].splitlines()
+        sink = next(i for i, line in enumerate(lines) if ".execute(" in line)
+        self.assertIn("must not report it", lines[sink - 1])
+
+    def test_only_the_case_category_decides_its_outcome(self):
+        case = {"case": "x", "category": "sqli", "real": False, "cwe": 89}
+        other = capability_check._vuln_judgment(
+            case, [{"cwe": 79, "title": "xss"}]
+        )
+        self.assertEqual((other["outcome"], other["other_cwes"]), ("tn", [79]))
+        parent = capability_check._vuln_judgment(
+            {**case, "real": True}, [{"cwe": 943, "title": "query"}]
+        )
+        self.assertEqual((parent["outcome"], parent["exact_cwe"]),
+                         ("tp", False))
+        self.assertEqual(
+            capability_check._vuln_findings('[{"cwe": "CWE-89"}]')[0]["cwe"],
+            89,
+        )
+        self.assertEqual(
+            capability_check._vuln_findings('[{"cwe": 89}]')[0]["cwe"], 89)
+        for broken in ('[{}]', '[{"cwe": "unknown"}]', '[{"cwe": 89.5}]',
+                       '[{"cwe": [89, 79]}]', '[{"cwe": "CWE-89 or 79"}]',
+                       '[{"cwe": true}]'):
+            with self.assertRaises(ValueError):
+                capability_check._vuln_findings(broken)
+        bait = capability_check._vuln_judgment(
+            case, [{"cwe": 89, "title": "sqli"}])
+        self.assertEqual((bait["outcome"], bait["exact_cwe"]), ("fp", False))
+
+    def test_score_is_tpr_plus_tnr_minus_one(self):
+        class Flags(FitnessFake):
+            """Reports SQL injection everywhere: every sqli case is
+            positive, every other category negative."""
+
+            def vulnerabilities(self, prompt):
+                return json.dumps([{"cwe": 89, "title": "sqli"}])
+
+        cases = capability_check.vuln_cases(self.files)
+        evidence = capability_check.run_vuln_identification(
+            Flags(), FITNESS_CONFIG, cases
+        )
+        self.assertEqual(evidence["outcomes"],
+                         {"tp": 1, "fn": 13, "fp": 1, "tn": 13})
+        self.assertAlmostEqual(evidence["score"], 0.0)
+        low, high = evidence["interval"]
+        self.assertAlmostEqual(low, -high)
+        self.assertTrue(0.2 < high < 0.4)
+        self.assertEqual(evidence["injection"], "tp")
+        self.assertEqual(evidence["by_category"]["sqli"], {"tp": 1, "fp": 1})
+        self.assertEqual(evidence["by_category"]["xss"], {"fn": 1, "tn": 1})
+
+    def test_an_unjudged_case_counts_as_wrong(self):
+        class Broken(FitnessFake):
+            def vulnerabilities(self, prompt):
+                return "not json"
+
+        cases = capability_check.vuln_cases(self.files)[:2]
+        evidence = capability_check.run_vuln_identification(
+            Broken(), FITNESS_CONFIG, cases
+        )
+        self.assertEqual((evidence["cases"], evidence["unjudged"]), (2, 2))
+        # The real case is missed, the false one never cleared.
+        self.assertEqual((evidence["tpr"], evidence["tnr"]), (0.0, 0.0))
+        self.assertEqual(evidence["samples"][0]["failure"], "format")
+
+    def test_a_failed_request_or_leak_counts_as_wrong(self):
+        class Failing(FitnessFake):
+            calls = 0
+
             def chat(self, messages, **kwargs):
-                result = super().chat(messages, **kwargs)
-                result.reasoning = ""
-                return result
+                if "Identify Vulnerabilities" not in str(
+                        messages[0]["content"]):
+                    return super().chat(messages, **kwargs)
+                self.calls += 1
+                if self.calls % 2:
+                    raise ConnectionResetError("reset by peer")
+                return _answer('[{"cwe": 89, "title": "<think>"}]')
+
+        cases = capability_check.vuln_cases(self.files)[:4]
+        evidence = capability_check.run_vuln_identification(
+            Failing(), FITNESS_CONFIG, cases
+        )
+        failures = sorted(row["failure"] for row in evidence["samples"])
+        self.assertEqual(failures, ["error", "error", "leak", "leak"])
+        self.assertEqual(evidence["unjudged"], 4)
+        self.assertEqual((evidence["tpr"], evidence["tnr"]), (0.0, 0.0))
+
+    def test_cases_stop_once_the_clean_floor_is_lost(self):
+        class Looping(FitnessFake):
+            def vulnerabilities(self, prompt):
+                return "x"
+
+            def chat(self, messages, **kwargs):
+                if "Identify Vulnerabilities" in str(messages[0]["content"]):
+                    return _answer("", finish="length")
+                return super().chat(messages, **kwargs)
+
+        cases = capability_check.vuln_cases(self.files)
+        evidence = capability_check.run_vuln_identification(
+            Looping(), FITNESS_CONFIG, cases, budget=2
+        )
+        self.assertEqual((evidence["cases"], evidence["planned"]), (3, 28))
+        self.assertIn("3 engine failures, past the 2", evidence["stopped"])
+        self.assertEqual(capability_check.clean_allowance(36), 3)
+        self.assertEqual(capability_check.clean_allowance(30), 3)
+
+    def test_cases_stop_once_halted(self):
+        cases = capability_check.vuln_cases(self.files)
+        clock = iter([None] * 3)
+        evidence = capability_check.run_vuln_identification(
+            FitnessFake(), FITNESS_CONFIG, cases,
+            halt=lambda: next(clock, "time limit"),
+        )
+        self.assertEqual((evidence["cases"], evidence["planned"]), (3, 28))
+        self.assertEqual(evidence["stopped"], "time limit")
+        # Asked only with a case waiting: a halt after the last is no stop.
+        clock = iter([None] * 28)
+        evidence = capability_check.run_vuln_identification(
+            FitnessFake(), FITNESS_CONFIG, cases,
+            halt=lambda: next(clock, "time limit"),
+        )
+        self.assertEqual((evidence["cases"], evidence["stopped"]), (28, None))
+
+    def _halted_run(self, adapter, config=FITNESS_CONFIG,
+                    source_error=AssertionError("no cases expected"),
+                    **kwargs):
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"CAPABILITY_OUTPUT_DIR": directory}
+        ), mock.patch.object(
+            capability_check, "load_owasp_python", side_effect=source_error,
+        ), contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = run_capability_check(
+                runtime="fake", tag="fixture", model="fixture",
+                adapter=adapter, config=config,
+                identity={"checked": True, "matched": True},
+                fitness_samples=2, output_format="json", **kwargs,
+            )
+        return code, json.loads(output.getvalue())
+
+    def test_a_time_limit_leaves_the_verdict_undecided(self):
+        code, report = self._halted_run(FitnessFake(), time_limit=1e-9)
+        self.assertEqual((code, report["status"]), (3, "undecided"))
+        self.assertEqual(report["failed_checks"], [])
+        self.assertIn("time limit", report["halted"])
+        self.assertEqual(report["compatibility"]["engine_failures"], {})
+        self.assertIn("time limit", report["checks"]["vuln_identification"][
+            "reason"])
+        self.assertFalse(report["audit_aptitude"]["scored"])
+
+    def test_a_signal_halts_sampling_and_keeps_the_report(self):
+        class Signalled(FitnessFake):
+            def chat(self, messages, **kwargs):
+                if "Select Security" in str(messages[0]["content"]):
+                    # The installed handler, as a first signal runs it.
+                    signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+                return super().chat(messages, **kwargs)
+
+        class Aborted(FitnessFake):
+            def chat(self, messages, **kwargs):
+                if "Select Security" in str(messages[0]["content"]):
+                    handler = signal.getsignal(signal.SIGTERM)
+                    handler(signal.SIGTERM, None)
+                    # The same stop arriving twice is still one stop.
+                    handler(signal.SIGTERM, None)
+                    with mock.patch.object(capability_check,
+                                           "SIGNAL_REPEAT", -1):
+                        handler(signal.SIGTERM, None)
+                return super().chat(messages, **kwargs)
+
+        before = signal.getsignal(signal.SIGTERM)
+        code, report = self._halted_run(Signalled())
+        self.assertEqual((code, report["halted"]), (3, "interrupted"))
+        with mock.patch.object(capability_check.os, "_exit") as abort:
+            self._halted_run(Aborted())
+        abort.assert_called_once_with(128 + signal.SIGTERM)
+        rows = report["checks"]["fitness"]["tasks"]["selection"]["samples"]
+        self.assertEqual(len(rows), 1)
+        self.assertIs(signal.getsignal(signal.SIGTERM), before)
+
+    def test_an_unloadable_source_leaves_the_verdict_undecided(self):
+        code, report = self._halted_run(
+            FitnessFake(), source_error=RuntimeError("not the pinned"))
+        self.assertEqual((code, report["status"]), (3, "undecided"))
+        self.assertIn("not the pinned", report["halted"])
+        self.assertIn("not the pinned", report["audit_aptitude"]["reason"])
+
+    def test_no_sampling_skips_the_cases(self):
+        code, report = self._halted_run(
+            FitnessFake(), config=dataclasses.replace(FITNESS_CONFIG,
+                                                      sampling={}))
+        self.assertEqual(code, 1)
+        self.assertEqual(report["failed_checks"], ["fitness"])
+        self.assertIn("fitness did not run", report["checks"][
+            "vuln_identification"]["reason"])
+
+    def test_failed_fitness_skips_the_cases(self):
+        class Runaway(FitnessFake):
+            def chat(self, messages, **kwargs):
+                if "Select Security" in str(messages[0]["content"]):
+                    return _answer("", finish="length")
+                return super().chat(messages, **kwargs)
 
         output = io.StringIO()
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
             os.environ, {"CAPABILITY_OUTPUT_DIR": directory}
+        ), mock.patch.object(
+            capability_check, "load_owasp_python",
+            side_effect=AssertionError("no cases expected"),
+        ), contextlib.redirect_stdout(output):
+            code = run_capability_check(
+                runtime="fake", tag="fixture", model="fixture",
+                adapter=Runaway(), config=FITNESS_CONFIG,
+                identity={"checked": True, "matched": True},
+                fitness_samples=2, output_format="json",
+            )
+        report = json.loads(output.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(report["checks"]["vuln_identification"]["status"],
+                         "skipped")
+        self.assertIn("fitness_clean", report["failed_checks"])
+        self.assertFalse(report["audit_aptitude"]["scored"])
+
+    def test_an_unverified_download_is_never_cached(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"<html>proxy"
+        with tempfile.TemporaryDirectory() as directory:
+            cache = pathlib.Path(directory) / "owasp.tar.gz"
+            with mock.patch.object(capability_check, "_owasp_cache_path",
+                                   return_value=cache), \
+                    mock.patch.object(capability_check.urllib.request,
+                                      "urlopen", return_value=response), \
+                    self.assertRaises(Exception):
+                capability_check.load_owasp_python()
+            self.assertEqual(list(pathlib.Path(directory).iterdir()), [])
+
+    def test_source_must_match_the_pin_whatever_its_form(self):
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "checkout"
+            for path, text in self.files.items():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            (root / "README.md").write_text("ignored", encoding="utf-8")
+            tarball = pathlib.Path(directory) / "upstream.tar.gz"
+            with tarfile.open(tarball, "w:gz") as archive:
+                archive.add(root, arcname="BenchmarkPython-pin")
+            digest = capability_check.owasp_digest(self.files)
+            with mock.patch.object(
+                capability_check, "OWASP_PYTHON_SHA256", digest
+            ):
+                for source in (root, tarball):
+                    with self.subTest(source=source.name):
+                        self.assertEqual(
+                            capability_check.load_owasp_python(str(source)),
+                            self.files,
+                        )
+                (root / "helpers/utils.py").write_text("changed")
+                with self.assertRaisesRegex(RuntimeError, "not the pinned"):
+                    capability_check.load_owasp_python(str(root))
+
+    def test_report_prints_compatibility_and_aptitude(self):
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+            os.environ, {"CAPABILITY_OUTPUT_DIR": directory}
+        ), mock.patch.object(
+            capability_check, "load_owasp_python",
+            return_value=synthetic_owasp(),
         ), contextlib.redirect_stdout(output):
             code = run_capability_check(
                 runtime="fake", tag="fixture", model="fixture",
@@ -1645,8 +2100,18 @@ class AuditFitnessTest(unittest.TestCase):
                 identity={"checked": True, "matched": True},
                 fitness_samples=1,
             )
-        self.assertEqual(code, 0)
-        self.assertIn("fitness workflow: 1/1 passed", output.getvalue())
+            listing = io.StringIO()
+            with contextlib.redirect_stdout(listing):
+                main(["--list"])
+        text = output.getvalue()
+        self.assertEqual(code, 0, text)
+        self.assertIn("passed vuln +0.00", listing.getvalue())
+        self.assertIn("fitness workflow: 1/1 passed", text)
+        self.assertIn("vuln identification: score +0.00 [", text)
+        self.assertIn("thinking_disabled untested", text)
+        self.assertIn("clean: 30/30 = 100% (floor 90%); "
+                      "fitness clean 2/2 (floor 1)", text)
+        self.assertIn("audit aptitude: sound 2/2 judged", text)
 
 
 if __name__ == "__main__":

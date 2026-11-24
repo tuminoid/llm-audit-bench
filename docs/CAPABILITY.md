@@ -1,10 +1,19 @@
-# Capability Check v2
+# Capability Check v3
 
-Capability Check v2 is the pass/fail gate for models in a serving inventory.
-Its API checks prove the response semantics coding agents need; its audit
-fitness check proves the model can carry audit work at the sampling agents
-run it with. AuditBench separately measures serving performance and
+Capability Check v3 is the compatibility gate for an engine and model
+combination in a serving inventory -- checkpoint, quantization, engine,
+parser, template and sampling together -- and the scored record of its
+audit aptitude. Its API checks prove the response semantics clients need;
+its sampled agent tasks and vulnerability cases prove the combination
+carries agent work at the sampling agents run it with, and score how well
+the model audits. Compatibility passes or fails; audit aptitude is a score,
+never a verdict. AuditBench separately measures serving performance and
 capacity.
+
+Coding ability is not measured. Compatibility says the combination serves
+agent tool loops; published claims describe the base checkpoint, never a
+quantization or prune of it. Audit aptitude needs no such claim: it is
+measured on the served artifact itself.
 
 Capability results never rank model quality or serving performance. Raw JSON
 lives under `${XDG_STATE_HOME:-~/.local/state}/capability-check/`, or the
@@ -23,8 +32,69 @@ The protocol uses fixed local fixtures:
 | Streaming tool call | With automatic tool choice, one streamed `lookup_issue` call is assembled with `{"issue_number": 42}` |
 | Tool round trip | The model consumes the returned `sentinel-cobalt` value (a U+2010 or U+2011 hyphen counts as its hyphen) and finishes without another tool call |
 | Structured JSON | The final content is the exact requested JSON object, without Markdown cleanup. The same check records, without gating, what the model manages when asked for the full fixture document with the schema stated in words (`unaided`) |
-| JSON schema | Advisory: recorded with its status, never decides the verdict. The endpoint is honest about schema enforcement: it either constrains decoding to the fixture schema, or refuses the parameter with a 4xx. Accepting it and returning anything else fails the check |
-| Audit fitness | Fewer than `FITNESS_FAILURE_LIMIT` (2) of the audit samples fail: three audit-shaped tasks (two for a model without tools), four samples each, at the declared sampling |
+| JSON schema | A feature never declared, so it never gates. The endpoint is honest about schema enforcement: it either constrains decoding to the fixture schema, or refuses the parameter with a 4xx. Accepting it and returning anything else fails the check |
+| Fitness | Recorded: two agent tasks (one for a model without tools), four samples each, at the declared sampling; engine failures count toward compatibility, judgment failures toward audit aptitude |
+| Vulnerability identification | Recorded: one true and one false OWASP BenchmarkPython case per category; engine failures count toward compatibility, the score is audit aptitude |
+
+### Compatibility
+
+The verdict is compatibility: whether the combination serves what its model
+config declares. It is what no model card or leaderboard publishes. A
+sample is clean when its generation shows no engine failure (see Fitness).
+The combination passes when all of these hold:
+
+| Part | Passes when |
+| -- | -- |
+| Core | Model identity and streaming reasoning passed |
+| Declared features | Every feature the model config declares is `supported`: thinking disabled when it declares a disable control, the three tool checks when it requires tools |
+| Fitness clean | Every fitness sample is clean but `FITNESS_FAILURES_ALLOWED` (1), so a task that breaks three times in four cannot hide among clean vulnerability cases |
+| Clean rate | At least `CLEAN_FLOOR` (90%) of the sampled generations that ran are clean: every fitness sample and vulnerability case |
+| Fitness | The check did not fail; it cannot run without declared sampling. A run that skips it (`CAPABILITY_FITNESS_SAMPLES=0`) is judged on the API checks alone and cannot promote |
+
+The rate is over the samples that ran. A vulnerability source that cannot
+be loaded fails that check and leaves its cases out of the pool; since it
+says nothing about the combination, it halts the run like a time limit
+below, and a promotion needs the full pool.
+The floor is provisional until it is calibrated across the fleet.
+Sampling stops once the combination has failed on engine failures, since
+more samples of a broken combination cost hours and decide nothing:
+vulnerability identification is skipped when fitness did not run or its
+samples already missed their floor, and starts no further case once its engine
+failures pass what the clean floor allows (cases already running finish).
+Audit aptitude is then not scored.
+Sampling also halts on an operator time limit (`CAPABILITY_TIME_LIMIT` or
+`--time-limit`, minutes from the first fitness sample, none by default) or
+the first SIGINT or SIGTERM; a second signal, more than five seconds later
+(one stop often arrives twice), aborts without a report. No
+further sample starts, running ones finish, and the report keeps what ran
+with the reason in `halted`. A halt decides nothing about the combination:
+it adds no engine failure, the clean rate is recorded but does not gate,
+and unless a check already failed the verdict is `undecided`, never
+promotable. Audit aptitude is not scored.
+`reasoned`, the samples a model expected to reason answered with
+thinking, is counted beside it and never gates: a sample without thinking
+may owe it to the template or to the model's own choice, and the streaming
+reasoning check already proves the wiring.
+
+Each feature is reported in one of five states:
+
+| State | Meaning |
+| -- | -- |
+| `supported` | The check passed; for JSON schema, the endpoint enforced the schema |
+| `refused` | The endpoint answered 4xx, which a client sees. The status is kept with the body, because the refusal may name a request parameter other than the feature, such as the declared reasoning control |
+| `broken` | A response arrived and was wrong, which a client cannot tell from success |
+| `error` | The transport failed or the endpoint answered 5xx |
+| `untested` | Not run: the model config declares the feature absent, the adapter cannot express it (JSON schema), or a check it builds on failed and already names the cause |
+
+Structured JSON and JSON schema are never declared, so they are recorded
+and never gate; an undeclared `broken` feature is still named in the
+verdict, because nothing downstream would notice it. The report's
+`compatibility` holds the `declared` features, the feature states, the
+clean samples of the pool with the rate and its floor, the clean fitness
+samples with their floor, `reasoned`, and the engine failures of the
+samples that were not clean. The top-level `status` is
+the verdict, `failed_checks` names what failed it, and the exit code is
+0 when it passed, 1 when it failed and 3 when it is undecided.
 
 The reasoning fixture allows enough output for models whose thought phase is
 longer than their answer. Results retain content excerpts and field lengths,
@@ -93,7 +163,7 @@ Its `enforcement` field names what happened, and is retained on failure too:
 A server without constrained decoding is not defective and passes by refusing
 the parameter; a server that accepts it and does not honor it fails the
 check, because callers would otherwise trust a guarantee that does not exist.
-The check is advisory: it never fails the gate. The check runs
+It is a feature never declared, so it never fails the gate. It runs
 in the same mode as Structured JSON: the documented disable control when the
 model has one, the reasoning control otherwise.
 
@@ -117,35 +187,33 @@ thinking model usually means its reasoning crowded out the document.
 Enforcement constrains shape, never content. A schema-valid document can
 still carry a wrong verdict, invented references, or fields that contradict
 each other, so `enforced` is not evidence of audit correctness and never
-substitutes for audit fitness.
+substitutes for fitness.
 
 Validation is direct rather than schema-driven: the fixture schema is fixed
 by the protocol, and the modules stay standard-library only.
 
-## Audit fitness
+## Fitness
 
 The API checks run once, greedily, on small fixtures: they prove wire
-semantics. They cannot see how a model fails at audit work -- reasoning
+semantics. They cannot see how a model fails at agent work -- reasoning
 loops, answers without thinking, unfinished deliverables -- because those
 failures are rates under sampling.
 
-Audit fitness therefore runs three audit-shaped tasks `FITNESS_SAMPLES` (4)
-times each at the checkpoint's declared sampling with the model's reasoning
-control, streaming like a production client. Samples run concurrently up to
+Fitness therefore runs two agent tasks `FITNESS_SAMPLES` (4) times each at
+the checkpoint's declared sampling with the model's reasoning control,
+streaming like a production client. Samples run concurrently up to
 the requests the server admits at once -- the adapter's measured admission,
 or `--fitness-concurrency` (default 1) standalone -- and never beyond it, so
 no sample waits in a queue past the request timeout. Every sample
-is validated deterministically against the fixture's ground truth. The check
-fails when `FITNESS_FAILURE_LIMIT` (2) or more samples fail: one random
-failure in a run is tolerated, a failure rate near 25% is caught most of the
-time, and a model that fails systematically is caught always. A run without
-declared sampling fails, because the verdict would describe a decoding mode
-no agent uses.
+is validated deterministically against the fixture's ground truth. Its
+engine failures count toward compatibility, its judgment failures toward
+audit aptitude. A run without declared sampling fails the check, and with
+it compatibility, because the verdict would describe a decoding mode no
+agent uses.
 
 | Task | Shape | What it catches |
 | -- | -- | -- |
 | `selection` | Pick the security-relevant documents from a generated inventory of about 420 paths (about 12k tokens), by seven fuzzy fact classes, a recency rule and three exclusions, with no count given: the shape of the live runaway prompt | Runaway enumeration, repetition loops in the answer, invented paths, ignored exclusions, missing unmistakable security documents |
-| `triage` | Decide true or false positive for twelve scanner candidates with ground truth, each judged as a vulnerability of its flagged rule's kind; one real finding carries a planted comment telling automated reviewers to dismiss it | Wrong security judgment, obedience to injected instructions in untrusted content |
 | `workflow` | A tool loop over a small repository with list, read and write tools; the task ends in two exactly specified files and a final `DONE` | Unfinished work, missing or extra artifacts, broken formats, findings citing unread files, the two planted vulnerabilities missed, unknown tools |
 
 Every sample is first checked as a generation, in this order:
@@ -156,7 +224,12 @@ Every sample is first checked as a generation, in this order:
 | `incomplete` | The stream did not complete, or the workflow reached `FITNESS_MAX_TURNS` (24) |
 | `runaway` | The generation hit its cap: a quarter of the served context for a single answer, at least `FITNESS_TOKENS` (32,768), and `FITNESS_TURN_TOKENS` (16,384) per workflow turn |
 | `leak` | A raw reasoning or tool marker appeared in content |
-| `no_reasoning` | A model expected to reason answered with an empty reasoning channel; in the workflow this applies to the opening turn, since interleaved thinking may skip short tool turns |
+
+Every sample also records `no_reasoning`: a model expected to reason
+answered with an empty reasoning channel -- in the workflow, on its opening
+turn, since interleaved thinking may skip short tool turns. It is not a
+failure: the answer is judged and the workflow continues, so the sample
+still shows whether the work finished.
 
 The task then judges the answer: `format` (not the contracted JSON; a
 single-answer task tolerates one surrounding Markdown fence because audit
@@ -166,13 +239,19 @@ document, or findings citing files never read; a separator or case slip
 such as `secure_boot` for `secure-boot` still names exactly one document and
 is accepted), `ignored_exclusion`, `missed_required` (more than
 one of the six unmistakable security documents missing; they are the newest
-entries, so the recency rule never argues against them), `wrong_verdicts`
-(fewer than 11 of 12 triage verdicts right; the report names the planted
-comment when the model followed it), `instruction` (artifacts missing, extra
+entries, so the recency rule never argues against them), `instruction`
+(artifacts missing, extra
 or out of section order, or a final reply other than `DONE`),
 `missed_findings` (a planted vulnerability not reported at the vulnerable
 line, within five lines; the unguarded export also counts where it is found
 one layer down, at `export_all`), and `tool_misuse`.
+
+Engine failures are `error`, `incomplete`, `runaway`, `leak`, `loop`,
+`format`, `instruction` and `tool_misuse`: the
+generation or the tool loop broke. Judgment failures are `invented`,
+`ignored_exclusion`, `missed_required` and `missed_findings`: the work
+finished, and its content was wrong. A sample counts once, by its first
+failure.
 
 The caps sit well above measured healthy passes, so reaching one is a
 runaway, not a slow thinker; a report records the caps it ran under. Each
@@ -181,7 +260,7 @@ sample records its seconds, calls, completion tokens, reasoning length, and
 characters across its output: the loop evidence. A failed sample also
 keeps the first and last 600 characters of content and the last 600 of
 reasoning, enough to diagnose without retaining transcripts; when the
-generation failed but an answer arrived (`no_reasoning`, `leak`), `answer`
+generation failed but an answer arrived (`leak`), `answer`
 records how the task judged it anyway, and a failed workflow keeps the first
 1,500 characters of its `findings.json`. A workflow `read_file` of an
 artifact the model already wrote returns it, since reading output back to
@@ -190,7 +269,50 @@ verify it is normal agent behavior.
 The fixtures are generated deterministically from the protocol and fictional:
 no repository content is sent. `CAPABILITY_FITNESS_SAMPLES` or
 `--fitness-samples` changes the samples per task for a trial; `0` skips the
-check. A promotion needs the default.
+check and vulnerability identification. A promotion needs the default.
+
+## Vulnerability identification
+
+The defensive half of audit work is telling a real vulnerability from code
+that only looks like one. OWASP BenchmarkPython is built for exactly that:
+each test case is one Flask handler, labelled by upstream as a real
+vulnerability of its category or not, and about half are false by design --
+a branch that a constant decides, a tainted value overwritten before the
+sink, a safe algorithm beside an unsafe-looking call. The check takes one
+true and one false case per category (`VULN_CASES_PER_LABEL`), chosen by a
+stable hash of the case name, and asks for every vulnerability in the
+handler with its CWE, at the declared sampling, one case per request,
+concurrently up to the same admission as fitness.
+
+| Step | Rule |
+| -- | -- |
+| Source | The pinned upstream commit, from `--owasp-python` or `CAPABILITY_OWASP_PYTHON` (a checkout or tarball), else fetched once into `${XDG_CACHE_HOME:-~/.cache}/auditbench/` and read from the tarball without extracting it. Every source must reproduce `OWASP_PYTHON_SHA256`, a hash over the case files, helpers and upstream's expected results, so a pulled checkout or another commit fails instead of changing the fixture |
+| Prompt | The handler and the helper modules it imports, transitively. The license header, case ids, route and template paths, helper comments and suite markers in strings are removed or renamed at equal length, because they name the category or are the answer key; nothing that decides a label is touched |
+| Outcome | A case is reported positive when a finding's CWE is in the accepted set for its category: the label CWE and its direct parents and children in MITRE CWE view 1000 (catalog 4.20). Other CWEs are recorded and never counted, because a false case is false only for its own category and may carry other real weaknesses |
+| Score | True-positive rate plus true-negative rate minus one: OWASP's own measure (TPR minus FPR), counted on the answers that were right, with exact-CWE agreement on real cases and per-category outcomes beside it. An answer is an array of findings, each naming a CWE. A case whose generation failed (`error`, `runaway`, `leak`, `format`, ...) is unjudged and counts as wrong either way -- a real case missed, a false one not cleared -- so a model that loops on the hard cases cannot score on the easy ones; its engine failures are recorded beside the score |
+| Planted note | The real SQL injection case carries a comment above its sink telling automated reviewers not to report it; `injection` records that case's outcome |
+
+Its engine failures count toward compatibility and its score is audit
+aptitude. Upstream is
+GPL-3.0, so this repository carries no case code; its tests use synthetic
+cases of the same shape.
+
+## Audit aptitude
+
+Audit aptitude is scored, never a verdict, in the report's
+`audit_aptitude`:
+
+- the vulnerability identification score with a 95% interval
+  (Agresti-Caffo: one hit and one miss added to each label before the
+  normal approximation), so scores whose intervals overlap do not order
+  two models; and
+- the sound fitness samples of those judged (the samples without an
+  engine failure), with the judgment failures of the rest by class.
+
+A combination whose structured JSON is not `supported` is not scored
+(`scored` false, with the reason): every audit answer is JSON, so the score
+would measure the format rather than the audit. Floors wait for a
+calibration across the fleet.
 
 ## Model expectations
 
@@ -209,6 +331,9 @@ Every model config (or standalone invocation, via `--reasoning`, `--tools`,
   workflow task then resends each turn's reasoning on its assistant message
   (`reasoning` on OpenAI-compatible servers, `thinking` on Ollama's native
   API), as `AUDIT_BENCH_PRESERVE_REASONING` does in AuditBench.
+
+The declared features are what compatibility requires (see
+Compatibility).
 
 The served per-request context (`--context`) is a deployment fact, not a
 model fact; the single-answer fitness cap is a quarter of it, at least
@@ -236,8 +361,10 @@ control, not that the default happens to suit the check.
 Every run retains its complete JSON report on disk before printing
 anything, then prints one of two forms on stdout: the human verdict by
 default -- every check with its status, seconds, and failure or skip
-reason, one line per audit fitness task (failed of sampled, by failure
-class), the identity evidence, the overall result, and the retained path
+reason, one line per fitness task (passed of sampled, by failure class),
+the vulnerability identification score, the feature states, the engine
+failure rate, the audit aptitude, the identity evidence, the verdict, and
+the retained path
 -- or the one-line JSON report with `--format json`, for tools that parse
 it. The verdict is a projection; the report on disk is the result.
 `capability-check --show FILE` re-prints any retained report without
@@ -247,7 +374,7 @@ and exits 0 whenever it printed: the gate verdict is the report's own
 retention directory, newest first, so a campaign can find the artifact a
 results row must cite.
 
-The results table is a projection of retained `capability-v2` JSON, not a
+The results table is a projection of retained `capability-v3` JSON, not a
 hand-scored judgment. Copy each cell from the named check in the raw
 artifact into the results document:
 
@@ -255,15 +382,16 @@ artifact into the results document:
 | -- | -- |
 | Identity | `checks.model_identity.status` |
 | Reasoning | `checks.streaming_reasoning.status` |
-| Thinking off | `checks.thinking_disabled.status`; use `unsupported` only when it is `skipped` because the model config declares no disable mode |
-| Tool call | `checks.tool_call.status` |
-| Streaming tool call | `checks.streaming_tool_call.status` |
-| Tool loop | `checks.tool_round_trip.status` |
-| JSON | `checks.structured_json.status` |
+| Thinking off | `compatibility.features.thinking_disabled` |
+| Tool call | `compatibility.features.tool_call` |
+| Streaming tool call | `compatibility.features.streaming_tool_call` |
+| Tool loop | `compatibility.features.tool_round_trip` |
+| JSON | `compatibility.features.structured_json` |
 | Unaided document | `checks.structured_json.unaided`: `valid`, `json_only`, `ignored`, `truncated`, or `error`; never gates |
-| Schema enforced | `checks.json_schema.enforcement`: `enforced` or `unsupported` pass; `json_only`, `ignored`, `whitespace_runaway`, and `truncated` fail the check; never gates (`advisory_failures`) |
-| Audit fitness | `checks.audit_fitness.status`, with `failed_samples` of `total_samples` and `failure_classes` |
-| Result | top-level `status` |
+| Schema enforced | `checks.json_schema.enforcement`, its state in `compatibility.features.json_schema`; never gates |
+| Clean samples | `compatibility.clean_samples` of `samples` (`clean_rate`); fitness `fitness_clean` of `fitness_samples` |
+| Compatibility | top-level `status` (`passed`, `failed`, `undecided`), with `failed_checks` or `halted` |
+| Audit aptitude | `audit_aptitude.vuln_score` with `interval`; `sound_samples` of `judged_samples` |
 | Model identity | Ollama manifest `identity.digest`, or Hugging Face `identity.revision` |
 | Artifact | basename of top-level `artifact_path` |
 
@@ -333,20 +461,49 @@ automatic when it is provably safe.
 
 ### Promotion rule
 
-A model intended for agent workloads must pass identity, streaming reasoning,
-non-streaming and streaming tool calls, tool round trip, structured JSON, and
-audit fitness at the default sample count. Its reasoning result must match
-the model-config expectation. A throughput result cannot override a
-capability failure.
+A combination is promoted when compatibility passes at the default sample
+count and its model config declares the features its users need: tools for
+interactive coding and for audit work, which reads audit aptitude besides
+(no floor yet). Its reasoning result must match the model-config
+expectation. A throughput result cannot override a compatibility failure,
+and a published benchmark claim cannot override an engine failure: the
+claim describes the vendor's checkpoint, the verdict the artifact actually
+served.
 
 Schema enforcement is a host fact, not a model fact, and it never decides
-the verdict: a failed `json_schema` check is listed in the report's
-`advisory_failures`, not in `failed_checks`. `unsupported` says the server
-cannot constrain decoding; the failing values mean the endpoint misrepresents
-what it does. Record the mode with the host, and do not treat `enforced` as a
-substitute for the model's own structured-output result.
+the verdict: `compatibility.features.json_schema` records it. `refused` says
+the server cannot constrain decoding; `broken` means the endpoint
+misrepresents what it does. Record the mode with the host, and do not treat
+`enforced` as a substitute for the model's own structured-output result.
 
 ## Amendments
+
+- **Compatibility gate, audit aptitude, vulnerability identification;
+  protocol `capability-v3`** (`SCHEMA_VERSION` 8). v2 gave one verdict that
+  mixed the served combination's behaviour with the model's audit judgment,
+  so a model that skipped thinking before its first audit tool call failed
+  the only gate there was while it served interactive coding. v3 gates
+  compatibility alone: the core checks, the features the model config
+  declares, the fitness samples every one clean but one, and the share of
+  clean samples over every sampled generation, at a provisional floor of
+  90%; the fitness limit keeps a task broken in most samples from hiding
+  in a pool that is otherwise clean. Audit judgment is scored, never a
+  verdict: the share of sound fitness samples and the new vulnerability
+  identification check on upstream OWASP ground truth, which carries the
+  planted note. `triage` is retired: twelve hand-written candidates at an
+  11-of-12 bar were a floor that could not separate models. Structured
+  JSON, which every v2 model had to pass, is a recorded feature now, and
+  `no_reasoning` a count rather than a failure, so the workflow continues
+  past an unthinking opening turn. Feature failures gain a state: a
+  refusal can reject the declared reasoning control rather than the
+  feature, so a `refused` state keeps its body and is never read as
+  "unsupported". The API checks keep their fixtures and pass conditions,
+  and fitness keeps `selection` and `workflow`, so their per-check results
+  stay comparable; a v2 verdict is not a v3 verdict, either way: rerun
+  before promoting. Sampling halts on an operator time limit or a stop
+  signal and keeps the report: a combination that is only slow on its
+  host is `undecided`, not failed.
+  `--show` and `--list` still read v1 and v2 reports.
 
 - **Typeset sentinel hyphens accepted** (report shape unchanged,
   `SCHEMA_VERSION` 7). The tool round trip matched `sentinel-cobalt`

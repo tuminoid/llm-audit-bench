@@ -8,7 +8,7 @@ workload shape, validation rule, and metric; runtime adapters supply only
 transport, capacity facts, and identity evidence.
 
 The benchmark measures serving performance and capacity. It does not score
-answer quality. A model also needs a Capability Check v2 pass
+answer quality. A model also needs a Capability Check v3 pass
 ([CAPABILITY.md](CAPABILITY.md)) before it belongs in the serving inventory.
 
 ## Workload model
@@ -277,7 +277,7 @@ call-level facts are counted without gating: calls that hit their cap (long
 thinking and a runaway both end there, and the count is the evidence), turns
 that ended with neither text nor a tool call, and calls that streamed no
 reasoning, which on a reasoning model means it answered without thinking.
-Audit fitness in Capability Check v2 judges model behavior at sampling;
+Fitness in Capability Check v3 judges model behavior at sampling;
 these counts show whether the same behavior appears at depth.
 
 Every call streams with `stream_options.include_usage`. The first streamed

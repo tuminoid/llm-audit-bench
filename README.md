@@ -9,17 +9,22 @@ workloads. Two instruments, one target: any OpenAI-compatible endpoint.
   -- sessions/hour, and prefill and decode rates as the context grows --
   plus a model-driven conversation profile for usability. Spec:
   [docs/PROTOCOL.md](docs/PROTOCOL.md).
-- **Capability Check v2** (`capability-check`) is the pass/fail model gate:
-  streaming reasoning, thinking-disabled control, tool calls in
-  non-streaming and streaming modes, tool round trip, structured JSON with a
-  measured unaided document, and audit fitness: audit-shaped tasks at the
-  declared sampling, judged against ground truth. It also records, without
-  gating, whether the server enforces a JSON schema or admits it cannot. Spec:
-  [docs/CAPABILITY.md](docs/CAPABILITY.md).
+- **Capability Check v3** (`capability-check`) is the pass/fail
+  compatibility gate for an engine and model combination: streaming
+  reasoning, the features its model config declares (thinking-disabled
+  control, tool calls in non-streaming and streaming modes, tool round
+  trip), and the share of clean generations over agent tasks and
+  vulnerability cases at the declared sampling. Undeclared features
+  (structured JSON, schema enforcement) are recorded as supported,
+  refused, broken or error. Audit aptitude is scored, never gating: OWASP
+  BenchmarkPython vulnerability identification and the share of sound
+  agent-task answers.
+  Spec: [docs/CAPABILITY.md](docs/CAPABILITY.md).
 
-AuditBench does not score answer quality, and audit fitness never ranks
-models: it passes or fails them. Benchmark rates and capability verdicts are
-different facts; keep them separate.
+AuditBench does not score answer quality, and fitness never ranks models: it
+passes or fails them. The vulnerability identification score is recorded
+beside the verdict, not a ranking. Benchmark rates and capability verdicts
+are different facts; keep them separate.
 
 ## What the endpoint must provide
 
@@ -33,13 +38,17 @@ different facts; keep them separate.
   gates and the 128-token reference). A short response is rejected, never
   padded.
 - Tool calling, for both profiles and for the capability gate.
+- For Capability Check's vulnerability identification, the pinned OWASP
+  BenchmarkPython source: fetched once from GitHub into
+  `${XDG_CACHE_HOME:-~/.cache}/auditbench/`, or supplied as a checkout or
+  tarball with `--owasp-python`. Upstream is GPL-3.0 and never vendored.
 
 You supply the facts the endpoint cannot state about itself: the configured
 per-request context, the checkpoint's sampling (`AUDIT_BENCH_SAMPLING`),
 and ideally the scheduler admission (`--active-slots`) and raw KV pool size
 (`--kv-tokens`). Without the capacity facts the harness assumes one slot and
 one context of KV and measures single-stream only; without sampling the
-result is not canonical and Capability Check audit fitness fails.
+result is not canonical and Capability Check fitness fails.
 
 ## Install
 
@@ -117,10 +126,11 @@ line names the file. `--format json` prints that same document on stdout
 instead, for tools that parse it.
 
 `capability-check` prints the same shape: a human verdict listing every
-check, its status, and any failure reason, plus one line per audit fitness
-task with its failure classes, with the retained JSON under
-`${XDG_STATE_HOME:-~/.local/state}/capability-check/` and `--format json`
-for tools.
+check, its status, and any failure reason, one line per fitness task with
+its failure classes, the vulnerability identification score, the feature
+states, the clean sample rate and the audit aptitude, with the retained
+JSON under `${XDG_STATE_HOME:-~/.local/state}/capability-check/` and
+`--format json` for tools.
 
 Either command lists what it has retained with `--list`, and re-prints one
 with `--show`, contacting no server. `--show` takes the file name straight
