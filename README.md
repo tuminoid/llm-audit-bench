@@ -3,7 +3,7 @@
 A test suite for local LLM serving setups under realistic security-audit
 workloads. Two instruments, one target: any OpenAI-compatible endpoint.
 
-- **AuditBench v2** (`audit-bench`) measures serving performance and
+- **AuditBench v3** (`audit-bench`) measures serving performance and
   capacity: a llama-bench-style pp512/tg128 reference, a near-context
   capacity proof, then scripted agent sessions at the model's own sampling
   -- sessions/hour, and prefill and decode rates as the context grows --

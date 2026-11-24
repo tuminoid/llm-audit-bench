@@ -1,6 +1,6 @@
-# AuditBench v2
+# AuditBench v3
 
-AuditBench v2 is the canonical serving benchmark for models used by agentic
+AuditBench v3 is the canonical serving benchmark for models used by agentic
 security audits and deep agentic coding sessions. It replaces
 runtime-specific prompt sizes with one protocol shared by every measured
 runtime. The harness in this repository (`audit_bench.py`) owns every
@@ -582,3 +582,15 @@ rung's existence depends on the one below; any thermal drift therefore falls
 on the later, higher rung and makes the ladder stop early rather than late.
 An incomplete 1x stops the ladder, where 2.4.0 still measured the top count.
 `SCHEMA_VERSION` 9 adds `audit_session.ladder_stop`.
+
+## Amendment: 3.0.0 (2026-11-19)
+
+Release 3.0.0 names the suite by its major version: AuditBench v3 is this
+benchmark as shipped from 3.0.0, beside Capability Check v3. The session
+workload did not change: `src/audit_bench.py` in 3.0.0 is byte-identical to
+2.5.0, so a result whose recorded harness hash matches 3.0.0's is an
+AuditBench v3 measurement whichever release ran it. The stored `protocol`
+stays `audit-v2`, so v3 results and 2.x results compare as the 2.x
+amendments state, and `audit-v1` stays incomparable. The module's
+docstrings and help text still say v2: renaming them changes the harness
+hash, so it waits for a release that changes the code.
