@@ -20,6 +20,7 @@ from capability_check import (
     _ollama_identity,
     _openai_identity,
     _output_dir,
+    capability_row,
     main,
     openai_control,
     ollama_control,
@@ -2112,6 +2113,93 @@ class VulnIdentificationTest(unittest.TestCase):
         self.assertIn("clean: 30/30 = 100% (floor 90%); "
                       "fitness clean 2/2 (floor 1)", text)
         self.assertIn("audit aptitude: sound 2/2 judged", text)
+
+
+def v3_report(**top) -> dict:
+    """A retained capability-v3 report trimmed to what a row reads plus the
+    fields a row must leave out."""
+    return {
+        "protocol": "capability-v3",
+        "schema_version": 8,
+        "status": "failed",
+        "failed_checks": ["fitness_clean"],
+        "halted": "vulnerability cases did not run: no source at /home/someone/x",
+        "runtime": "ollama",
+        "tag": "conf",
+        "model": "m:tag",
+        "host": "somehost",
+        "artifact_path": "/home/someone/state/r.json",
+        "identity": {"digest": "abc", "resolved_name": "m"},
+        "checks": {
+            "model_identity": {"status": "passed"},
+            "streaming_reasoning": {"status": "passed"},
+            "structured_json": {"status": "passed", "unaided": "valid"},
+            "json_schema": {"status": "passed", "enforcement": "enforced"},
+        },
+        "compatibility": {
+            "features": {"tool_call": "supported",
+                         "thinking_disabled": "untested"},
+            "clean_samples": 4, "samples": 8, "clean_rate": 0.5,
+            "fitness_clean": 4, "fitness_samples": 8, "engine_failures": {},
+        },
+        "audit_aptitude": {"scored": False,
+                           "reason": "failed: no source at /home/someone/x"},
+        **top,
+    }
+
+
+class CapabilityRowTest(unittest.TestCase):
+    def test_the_row_is_the_documented_mapping(self):
+        row = capability_row(v3_report())
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["failed_checks"], ["fitness_clean"])
+        self.assertIs(row["halted"], True)
+        self.assertEqual(row["identity_check"], "passed")
+        self.assertEqual(row["features"]["thinking_disabled"], "untested")
+        self.assertEqual(row["unaided_document"], "valid")
+        self.assertEqual(row["schema_enforcement"], "enforced")
+        self.assertEqual((row["fitness_clean"], row["fitness_samples"]),
+                         (4, 8))
+        self.assertEqual(row["model_identity"], "abc")
+        self.assertEqual(row["artifact"], "r.json")
+
+    def test_aptitude_is_read_as_stored(self):
+        unscored = capability_row(v3_report())["audit_aptitude"]
+        self.assertEqual(unscored, {"scored": False})
+        scored = {"scored": True, "vuln_score": 0.07,
+                  "interval": [-0.14, 0.26], "sound_samples": 8,
+                  "judged_samples": 8, "judgment_failures": {}}
+        row = capability_row(v3_report(audit_aptitude=scored))
+        self.assertEqual(row["audit_aptitude"]["vuln_score"], 0.07)
+        self.assertNotIn("judgment_failures", row["audit_aptitude"])
+
+    def test_the_row_leaves_out_host_paths_and_identity_objects(self):
+        text = json.dumps(capability_row(v3_report()))
+        for private in ("somehost", "/home/someone", "resolved_name"):
+            self.assertNotIn(private, text)
+
+    def test_show_refuses_a_row_for_an_older_protocol(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "v2.json"
+            path.write_text(
+                json.dumps(v3_report(protocol="capability-v2")),
+                encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "projects a capability-v3"):
+                main(["--show", str(path), "--format", "row"])
+            path.write_text(json.dumps(v3_report()), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = main(["--show", str(path), "--format", "row"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["tag"], "conf")
+
+    def test_row_format_needs_show(self):
+        with contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit):
+                main(["--base-url", "http://127.0.0.1:9", "--model", "m",
+                      "--format", "row"])
+        self.assertIn("--format row projects a retained report",
+                      errors.getvalue())
 
 
 if __name__ == "__main__":

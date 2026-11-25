@@ -2421,9 +2421,66 @@ def _summary_lines(report: dict) -> list[str]:
     return lines
 
 
+def capability_row(report: dict) -> dict:
+    """Project one retained report onto a published results row.
+
+    The fields are the docs/CAPABILITY.md "How results are generated"
+    mapping, read as stored, never recomputed: audit aptitude is the
+    report's own, including an unscored one. The host, paths, whole
+    identity objects and free-text failure messages stay out, so a serving
+    repository can commit the row: a halt is a flag, an unscored aptitude
+    has no reason; both are in the report.
+    """
+    if report.get("protocol") != PROTOCOL:
+        raise ValueError(
+            f"a row projects a {PROTOCOL} report, not "
+            f"{report.get('protocol')!r}"
+        )
+    checks = report["checks"]
+    compat = report.get("compatibility") or {}
+    aptitude = report.get("audit_aptitude") or {}
+    identity = report.get("identity") or {}
+    artifact = report.get("artifact_path")
+    return {
+        "protocol": report["protocol"],
+        "schema_version": report.get("schema_version"),
+        "runtime": report["runtime"],
+        "tag": report["tag"],
+        "model": report["model"],
+        "status": report["status"],
+        "failed_checks": report.get("failed_checks"),
+        "halted": bool(report.get("halted")),
+        "identity_check": (checks.get("model_identity") or {}).get("status"),
+        "reasoning": (checks.get("streaming_reasoning") or {}).get("status"),
+        "features": compat.get("features"),
+        "unaided_document": (checks.get("structured_json") or {}).get(
+            "unaided"
+        ),
+        "schema_enforcement": (checks.get("json_schema") or {}).get(
+            "enforcement"
+        ),
+        **{
+            key: compat.get(key)
+            for key in ("clean_samples", "samples", "clean_rate",
+                        "fitness_clean", "fitness_samples")
+        },
+        "audit_aptitude": {
+            key: aptitude[key]
+            for key in ("scored", "vuln_score", "interval", "sound_samples",
+                        "judged_samples")
+            if key in aptitude
+        },
+        "model_identity": identity.get("digest") or identity.get("revision"),
+        "artifact": pathlib.PurePath(artifact).name if artifact else None,
+    }
+
+
 def _print_report(report: dict, output_format: str) -> None:
     if output_format == "json":
         print(json.dumps(report, sort_keys=True))
+        return
+    if output_format == "row":
+        print(json.dumps(capability_row(report), sort_keys=True))
         return
     for line in _summary_lines(report):
         print(line)
@@ -2462,7 +2519,10 @@ def _show(path: pathlib.Path, output_format: str) -> int:
             f"{', '.join(missing)} absent"
         )
     report.setdefault("artifact_path", str(path))
-    _print_report(report, output_format)
+    try:
+        _print_report(report, output_format)
+    except ValueError as exc:
+        raise SystemExit(f"{path}: {exc}") from exc
     return 0
 
 
@@ -3092,11 +3152,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--format",
-        choices=("human", "json"),
+        choices=("human", "json", "row"),
         default="human",
         help=(
             "stdout report format (default human); the JSON report is "
-            "retained on disk either way"
+            "retained on disk either way; row, with --show only, prints the "
+            "published results row"
         ),
     )
     reports = parser.add_mutually_exclusive_group()
@@ -3124,6 +3185,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.list_reports:
         return _list_reports()
+    if args.format == "row" and not args.show:
+        parser.error("--format row projects a retained report; use --show")
     if args.show:
         return _show(args.show, args.format)
     for name in ("base_url", "model"):

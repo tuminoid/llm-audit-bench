@@ -395,6 +395,15 @@ artifact into the results document:
 | Model identity | Ollama manifest `identity.digest`, or Hugging Face `identity.revision` |
 | Artifact | basename of top-level `artifact_path` |
 
+`capability-check --show FILE --format row` prints this mapping for one
+`capability-v3` report as one JSON object, read as stored: audit aptitude is
+the report's own, including an unscored one, never recomputed.
+`capability_row()` is the same projection for tools that import the
+module. The host, paths, whole identity objects and free-text failure
+messages are left out: `halted` is a flag and an unscored aptitude carries
+no reason, both readable in the report. Older protocol reports are
+refused.
+
 Do not derive a pass from terminal prose, old benchmark notes, parser
 configuration, or manifest capability labels. The printed verdict is a
 reading aid, not a source: transcribe from the retained JSON. Do not copy
